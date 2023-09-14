@@ -1,0 +1,675 @@
+---
+title: "Filter feature and batch-correct"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(Biobase)
+library(assertthat)
+library(tidyverse)
+```
+
+```{r funcs}
+source("../src/pca.R", local = FALSE)
+source("../src/vst.R")
+```
+
+```{r "ggplot theme"}
+theme_set(theme_bw())
+```
+
+```{r random seed}
+set.seed(42)
+```
+
+Load TCGA
+```{r "load tcga"}
+tcga_eset <- aws.s3::s3readRDS(
+  object = "tcga_eset.Rds",
+  bucket = params$output_collection
+)
+```
+
+Create ExpressionSet object.
+```{r "create eset"}
+pheno_data <- aws.s3::s3read_using(
+  read_tsv,
+  col_types = cols(),
+  object = "samples_anno.tsv",
+  bucket = params$data_collection
+) %>%
+  column_to_rownames("A_SampleID") %>%
+  new("AnnotatedDataFrame", data = .)
+
+feature_data <- aws.s3::s3read_using(
+  read_tsv,
+  col_types = cols(),
+  object = "genes_anno.tsv",
+  bucket = params$data_collection
+) %>%
+  column_to_rownames("ID") %>%
+  new("AnnotatedDataFrame", data = .)
+
+counts <- aws.s3::s3read_using(
+  read_tsv,
+  col_types = cols(),
+  skip = 2,
+  object = "counts.gct",
+  bucket = params$data_collection
+)
+assert_that(all(counts$NAME == rownames(feature_data)))
+counts_mat <- counts %>%
+  select(-NAME, -Description) %>%
+  as.matrix()
+
+tpm <- aws.s3::s3read_using(
+  read_tsv,
+  col_types = cols(),
+  skip = 2,
+  object = "TPM.gct",
+  bucket = params$data_collection
+)
+assert_that(all(tpm$NAME == rownames(feature_data)))
+tpm_mat <- tpm %>%
+  select(-NAME, -Description) %>%
+  as.matrix()
+
+eset_full_raw_counts <- ExpressionSet(counts_mat, phenoData = pheno_data, featureData = feature_data)
+tpm_eset_full <- ExpressionSet(tpm_mat, phenoData = pheno_data, featureData = feature_data)
+
+eset_raw_counts <- eset_full_raw_counts[,!is.na(eset_full_raw_counts$CD8IMMPH)]
+tpm_eset <- tpm_eset_full[,!is.na(tpm_eset_full$CD8IMMPH)]
+```
+
+
+```{r "compute vst"}
+vst_model <- train_vst(exprs(eset_raw_counts))
+vst_mat_full <- apply_vst(exprs(eset_full_raw_counts), vst_model)
+
+eset_full <- ExpressionSet(vst_mat_full, phenoData = pheno_data, featureData = feature_data)
+eset <- eset_full[,!is.na(eset_full$CD8IMMPH)]
+```
+
+
+```{r "safety check that vst are idential as before", eval=FALSE}
+# make sure VST matrices are identical
+# 1. train_vst, apply to full, subset !is.na(CD8IMMPH)
+# 2. use vst from DESeq2
+vst_m_old_method <- DESeq2::vst(counts_mat[, !is.na(pheno_data$CD8IMMPH)])
+
+stopifnot(all(colnames(vst_m_old_method) == colnames(eset)))
+
+max(abs(exprs(eset) - vst_m_old_method)) # should be 0
+
+# compare with the old data
+
+eset_bc <- aws.s3::s3readRDS(
+  "eset_batch_corrected.Rds",
+  bucket = "UUID"
+)
+
+
+eset_subset <- eset[rownames(eset_bc), colnames(eset_bc)]
+
+
+max(abs(exprs(eset_subset) - exprs(eset_bc))) # should be ~0
+
+rm(eset_bc, eset_subset, vst_m_old_method)
+```
+
+Filter out lowly expressed genes
+```{r "remove lowly expressed"}
+q_expression <- apply(exprs(eset), 1, quantile, 0.9)
+
+qplot(q_expression, geom = "histogram", bins = 50) +
+  geom_vline(xintercept = 7, col = "red")
+
+cond <- q_expression > 7
+n_rm <- sum(!(cond))
+n_tot <- length(cond)
+message(str_glue("Filtering out {n_rm} out of {n_tot} ({round(100*n_rm/n_tot, 2)}%)"))
+
+eset <- eset[cond, ]
+```
+
+
+Only keep protein coding genes
+```{r "keep protein coding"}
+cond <- fData(eset)$type == "protein_coding"
+n_rm <- sum(!(cond))
+n_tot <- length(cond)
+message(str_glue("Filtering out {n_rm} out of {n_tot} ({round(100*n_rm/n_tot, 2)}%)"))
+eset <- eset[cond, ]
+```
+
+
+Only keep genes which are common between eset and TCGA eset (only genes expressed in TCGA lung).
+```{r "tcga_lung"}
+rownames(tcga_eset) <- str_replace(rownames(tcga_eset), "[.][0-9]+$", "")
+
+common_rownames <- sort(intersect(rownames(tcga_eset), rownames(eset)))
+
+cond <- rownames(eset) %in% common_rownames
+n_rm <- sum(!(cond))
+n_tot <- length(cond)
+message(str_glue("Filtering out {n_rm} out of {n_tot} ({round(100*n_rm/n_tot, 2)}%)"))
+eset <- eset[common_rownames, ]
+tcga_eset <- tcga_eset[common_rownames, ]
+```
+
+How comparable are mean and variance expression levels between our data and TCGA.
+```{r "mean variance roche/tcga"}
+mean_variance_comparison_plot(
+  roche = eset[, eset$INDICAT %in% c("LUNG", "NSCLC")],
+  tcga = tcga_eset[, tcga_eset$study %in% c("LUAD", "LUSC")]
+)
+```
+
+
+Exclude genes with vastly different expression levels.
+```{r "exclude based on expression"}
+med_expr <- tibble(
+  gene = rownames(eset),
+  roche = apply(exprs(eset), 1, median),
+  tcga = apply(exprs(tcga_eset), 1, median)
+) %>%
+  mutate(
+    delta_median = roche - tcga,
+    roche_rank = rank(roche),
+    tcga_rank = rank(tcga)
+  ) %>%
+  mutate(delta_rank = roche_rank - tcga_rank)
+
+thr_median <- quantile(med_expr$delta_median, c(0.05, .95))
+thr_rank <- quantile(med_expr$delta_rank, c(0.05, .95))
+
+ggplot(med_expr) +
+  aes(delta_rank) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = thr_rank, col = "red")
+
+ggplot(med_expr) +
+  aes(delta_median) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = thr_median, col = "red")
+
+ggplot(med_expr) +
+  aes(delta_median, delta_rank) +
+  geom_point(alpha = 0.1) +
+  geom_vline(xintercept = thr_median, col = "red") +
+  geom_hline(yintercept = thr_rank, col = "blue")
+
+cond <- med_expr %>%
+  filter(
+    delta_median > thr_median[1],
+    delta_median < thr_median[2],
+    delta_rank > thr_rank[1],
+    delta_rank < thr_rank[2]
+  ) %>%
+  pull(gene) %>%
+  {
+    rownames(eset) %in% .
+  }
+
+n_rm <- sum(!(cond))
+n_tot <- length(cond)
+message(str_glue("Filtering out {n_rm} out of {n_tot} ({round(100*n_rm/n_tot, 2)}%)"))
+eset <- eset[cond, ]
+tcga_eset <- tcga_eset[cond, ]
+```
+
+Exclude genes with vastly different variance
+```{r "exclude based on variance"}
+med_var <- tibble(
+  gene = rownames(eset),
+  roche = apply(exprs(eset), 1, var),
+  tcga = apply(exprs(tcga_eset[, tcga_eset$study == "LUAD"]), 1, var)
+) %>%
+  mutate(
+    delta_median = roche - tcga,
+    roche_rank = rank(roche),
+    tcga_rank = rank(tcga)
+  ) %>%
+  mutate(delta_rank = roche_rank - tcga_rank)
+
+thr_var_median <- quantile(med_var$delta_median, c(0.05, .95))
+thr_var_rank <- quantile(med_var$delta_rank, c(0.05, .95))
+
+ggplot(med_var) +
+  aes(delta_rank) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = thr_var_rank, col = "red")
+
+ggplot(med_var) +
+  aes(delta_median) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = thr_var_median, col = "red")
+
+ggplot(med_var) +
+  aes(delta_median, delta_rank) +
+  geom_point(alpha = 0.1) +
+  geom_vline(xintercept = thr_var_median, col = "red") +
+  geom_hline(yintercept = thr_var_rank, col = "blue")
+
+cond <- med_var %>%
+  filter(
+    delta_median > thr_var_median[1],
+    delta_median < thr_var_median[2],
+    delta_rank > thr_var_rank[1],
+    delta_rank < thr_var_rank[2]
+  ) %>%
+  pull(gene) %>%
+  {
+    rownames(eset) %in% .
+  }
+
+n_rm <- sum(!(cond))
+n_tot <- length(cond)
+message(str_glue("Filtering out {n_rm} out of {n_tot} ({round(100*n_rm/n_tot, 2)}%)"))
+eset <- eset[cond, ]
+tcga_eset <- tcga_eset[cond, ]
+```
+
+PCA analysis
+```{r "pca all"}
+mat <- cbind(exprs(eset), exprs(tcga_eset))
+pca <- prcomp(t(reduce_expression_matrix(mat)))
+
+annot <- bind_rows(
+  roche = pData(eset_full) %>% select(group = INDICAT, CD8IMMPH) %>% mutate(platform = "internal") %>% rownames_to_column("row"),
+  tcga = pData(tcga_eset) %>% select(group = study, platform = tcga.gdc_platform) %>% rownames_to_column("row"),
+  .id = "dataset"
+)
+
+pca_tidy <- broom::tidy(pca) %>%
+  filter(PC < 4) %>%
+  pivot_wider(names_from = PC, names_prefix = "PC", values_from = value) %>%
+  left_join(annot, by = "row")
+```
+
+```{r "plot PCA on all samples"}
+pca_tidy %>%
+  ggplot() +
+  aes(PC1, PC2, col = dataset) +
+  geom_point(alpha = 0.2)
+
+pca_tidy %>%
+  ggplot() +
+  aes(PC1, PC2, col = group) +
+  geom_point() +
+  theme(legend.position = "none")
+
+pca_tidy %>%
+  ggplot() +
+  aes(PC2, PC3, col = dataset) +
+  geom_point()
+```
+
+```{r "pca lung"}
+pca_tidy %>%
+  filter(group %in% c("LUAD", "LUSC", "LUNG", "NSCLC")) %>%
+  ggplot(aes(PC1, PC2, color = group)) +
+  geom_point(alpha = 0.5) +
+  stat_ellipse()
+```
+
+Compare median and variance expression in lungs
+```{r "median and variance of expression in lungs"}
+mean_variance_comparison_plot(
+  roche = eset[, eset$INDICAT %in% c("LUNG", "NSCLC")],
+  tcga = tcga_eset[, tcga_eset$study %in% c("LUAD", "LUSC")]
+)
+```
+
+
+```{r "tcga lung subset"}
+tcga_lung_subset <- tcga_eset[, tcga_eset$study == "LUAD" &
+  tcga_eset$tcga.cgc_sample_sample_type != "Solid Tissue Normal"]
+
+tcga_lung_subset %>%
+  pData() %>%
+  count(
+    tcga.gdc_cases.samples.sample_type,
+    tcga.cgc_case_histological_diagnosis,
+    tcga.xml_histological_type,
+    tcga.gdc_platform
+  ) %>%
+  arrange(-n) %>%
+  rename_with(~ str_replace(.x, "^tcga[.](gdc|cgc|xml)_(case_|cases[.]samples[.])?", "")) %>%
+  gt::gt()
+```
+
+```{r "subset eset"}
+eset_lung <- eset[, eset$INDICAT %in% c("NSCLC", "LUNG")]
+
+eset_lung %>%
+  pData() %>%
+  count(
+    INDICAT,
+    HIST
+  ) %>%
+  arrange(-n) %>%
+  gt::gt()
+```
+
+Perform PCA-based batch-correction
+
+```{r "pca"}
+mat_lung <- cbind(exprs(eset_lung), exprs(tcga_lung_subset))
+mat_lung_batch <- rep(c("roche", "tcga"), c(ncol(eset_lung), ncol(tcga_lung_subset)))
+mat_lung_means <- rowMeans(exprs(eset_lung))
+mat_lung_centered <- sweep(mat_lung, 1, mat_lung_means)
+
+
+pca_lung <- prcomp(t(mat_lung_centered), center = FALSE)
+
+pca_lung_tidy <- broom::tidy(pca_lung) %>%
+  filter(PC < 10) %>%
+  left_join(annot, by = "row") %>%
+  pivot_wider(names_from = PC, names_prefix = "PC", values_from = value)
+```
+
+```{r "pca lung subset"}
+plot_pca(pca_lung, mat_lung_batch)
+plot_pca(pca_lung, mat_lung_batch, PC3, PC4)
+plot_pca(pca_lung, mat_lung_batch, PC5, PC6)
+plot_pca(pca_lung, mat_lung_batch, PC6, PC7)
+```
+
+```{r "plot centers and SD difference"}
+plot_centers(pca_lung, mat_lung_batch, 30)
+plot_sd(pca_lung, mat_lung_batch, 500)
+```
+
+```{r "find transformation & batch correct"}
+centers <- find_centers(pca_lung, mat_lung_batch, 1:50)
+sds <- find_sd(pca_lung, mat_lung_batch, 1:50)
+
+mat_lung_centered_cor <- correct_batches(mat_lung_centered, pca_lung, centers, sds, mat_lung_batch,
+  variance = TRUE, reference_batch = "roche"
+)
+```
+
+PCA after correction
+First, we use learned pca to transform new data.
+```{r "pca after correction"}
+x_pca_lung_cor <- predict(pca_lung, t(mat_lung_centered_cor))
+df_pca_lung_cor <- as_tibble(x_pca_lung_cor) %>%
+  mutate(group = mat_lung_batch)
+
+df_pca_lung_cor %>%
+  ggplot(aes(PC1, PC2, col = group)) +
+  geom_point()
+
+df_pca_lung_cor %>%
+  ggplot(aes(PC3, PC4, col = group)) +
+  geom_point()
+
+df_pca_lung_cor %>%
+  ggplot(aes(PC5, PC6, col = group)) +
+  geom_point()
+```
+
+
+Now perform a new PCA
+```{r "new pca for batch corrected"}
+pca_lung_cor <- prcomp(t(mat_lung_centered_cor), center = FALSE)
+plot_pca(pca_lung_cor, mat_lung_batch) +
+  stat_ellipse()
+plot_pca(pca_lung_cor, mat_lung_batch, PC3, PC4)
+plot_pca(pca_lung_cor, mat_lung_batch, PC5, PC6)
+plot_pca(pca_lung_cor, mat_lung_batch, PC6, PC7)
+```
+
+
+Use learned change in mean in variance to transform the full TCGA
+```{r "batch correct TCGA"}
+mat_centered <- sweep(
+  cbind(
+    exprs(eset_full[rownames(eset),]),
+    exprs(tcga_eset)
+  ),
+  1,
+  mat_lung_means)
+anno <- bind_rows(
+  roche = pData(eset_full),
+  tcga = pData(tcga_eset),
+  .id = "dataset"
+)
+all_centered_cor <- correct_batches(mat_centered, pca_lung, centers, sds, anno$dataset,
+  variance = TRUE, reference_batch = "roche"
+)
+all_centered_cor_uncentered <- sweep(all_centered_cor, 1, mat_lung_means, "+")
+
+pca_cor <- prcomp(t(reduce_expression_matrix(all_centered_cor)), center = FALSE)
+
+pca_tidy <- broom::tidy(pca_cor) %>%
+  filter(PC < 4) %>%
+  pivot_wider(names_from = PC, names_prefix = "PC", values_from = value) %>%
+  left_join(annot, by = "row")
+```
+
+
+```{r "plot PCA on all samples after batch correction"}
+pca_tidy %>%
+  ggplot() +
+  aes(PC1, PC2, col = dataset) +
+  geom_point(alpha = 0.2)
+
+pca_tidy %>%
+  ggplot() +
+  aes(PC1, PC2, col = group) +
+  geom_point() +
+  theme(legend.position = "none")
+
+pca_tidy %>%
+  ggplot() +
+  aes(PC2, PC3, col = dataset) +
+  geom_point()
+```
+
+Only Roche subset
+
+```{r}
+pca_tidy %>%
+  filter(dataset == "roche") %>%
+  ggplot() +
+  aes(PC1, PC2, col = CD8IMMPH) +
+  geom_point()
+
+pca_tidy %>%
+  filter(dataset == "roche") %>%
+  ggplot() +
+  aes(PC1, PC2, col = group) +
+  geom_point() +
+  theme(legend.position="none")
+```
+
+
+```{r "pca plot lung, after batch correction"}
+pca_tidy %>%
+  filter(group %in% c("LUAD", "LUSC", "LUNG", "NSCLC")) %>%
+  ggplot(aes(PC1, PC2, color = group)) +
+  geom_point(alpha = 0.5) +
+  stat_ellipse()
+```
+
+Create batch-corrected ExpressionSets
+```{r "batch-corrected eset"}
+eset_cor <- eset_full[rownames(eset),]
+exprs(eset_cor) <- all_centered_cor_uncentered[, colnames(eset_cor)]
+
+tcga_eset_cor <- tcga_eset
+exprs(tcga_eset_cor) <- all_centered_cor_uncentered[, colnames(tcga_eset_cor)]
+```
+
+Compare median and variance expression in lungs after batch correction
+```{r "median and variance of expression in lungs after batch correction"}
+mean_variance_comparison_plot(
+  roche = eset_cor[, eset_cor$INDICAT %in% c("LUNG", "NSCLC")],
+  tcga = tcga_eset_cor[, tcga_eset_cor$study %in% c("LUAD", "LUSC")]
+)
+```
+
+
+
+We are expecting that Roche data (`eset`) won't be affected by the batch correction,
+since it's a reference batch.
+```{r "compare roche pre/post batch correction"}
+mean_variance_comparison_plot(
+  before_correction = eset,
+  after_correction = eset_cor
+)
+
+tibble(
+  before_correction = c(exprs(eset_full[rownames(eset),])),
+  after_correction = c(exprs(eset_cor))
+) %>%
+  sample_n(1e4) %>%
+  ggplot() +
+  aes(before_correction, after_correction) +
+  geom_point(alpha = 0.2) +
+  ggtitle("expression") +
+  ggpubr::stat_cor()
+```
+
+```{r "comparison of missing CD8 immune phenotype subset"}
+mean_variance_comparison_plot(
+  before_correction = eset_full[,is.na(eset_full$CD8IMMPH)],
+  after_correction = eset_cor[,is.na(eset_cor$CD8IMMPH)]
+)
+
+tibble(
+  before_correction = c(exprs(eset_full[rownames(eset),is.na(eset_full$CD8IMMPH)])),
+  after_correction = c(exprs(eset_cor[,is.na(eset_cor$CD8IMMPH)]))
+) %>%
+  sample_n(1e4) %>%
+  ggplot() +
+  aes(before_correction, after_correction) +
+  geom_point(alpha = 0.2) +
+  ggtitle("expression") +
+  ggpubr::stat_cor()
+```
+
+Compare TCGA before and after correction.
+```{r "compare TCGA pre/post batch correction"}
+mean_variance_comparison_plot(
+  before_correction = tcga_eset,
+  after_correction = tcga_eset_cor
+)
+
+tibble(
+  before_correction = c(exprs(tcga_eset)),
+  after_correction = c(exprs(tcga_eset_cor))
+) %>%
+  sample_n(1e4) %>%
+  ggplot() +
+  aes(before_correction, after_correction) +
+  geom_point(alpha = 0.2) +
+  ggtitle("expression") +
+  ggpubr::stat_cor() +
+  geom_density_2d()
+```
+
+
+```{r "compare batch-corrected eset to previously saved", eval=FALSE}
+# ---- eset_batch_corrected.Rds ----
+eset_cor_ <- aws.s3::s3readRDS(
+  "eset_batch_corrected.Rds",
+  bucket = "UUID"
+)
+
+eset_cor_known <- eset_cor[, !is.na(eset_cor$CD8IMMPH)]
+stopifnot(all(rownames(eset_cor_known) == rownames(eset_cor_)))
+stopifnot(all(colnames(eset_cor_known) == colnames(eset_cor_)))
+stopifnot(max(abs(exprs(eset_cor_known) - exprs(eset_cor_))) < 1e-15)
+rm(eset_cor_, eset_cor_known)
+
+# ---- tpm_eset.Rds ----
+tpm_eset_ <- aws.s3::s3readRDS(
+  "tpm_eset.Rds",
+  bucket = "UUID"
+)
+
+stopifnot(all(rownames(tpm_eset_) == rownames(tpm_eset)))
+stopifnot(all(colnames(tpm_eset_) == colnames(tpm_eset)))
+stopifnot(max(abs(exprs(tpm_eset_) - exprs(tpm_eset))) < 1e-15)
+rm(tpm_eset_)
+
+# ---- counts_eset.Rds ----
+eset_counts_ <- aws.s3::s3readRDS(
+  "counts_eset.Rds",
+  bucket = "UUID"
+)
+
+stopifnot(all(rownames(eset_counts_) == rownames(eset_raw_counts)))
+stopifnot(all(colnames(eset_counts_) == colnames(eset_raw_counts)))
+stopifnot(max(abs(exprs(eset_counts_) - exprs(eset_raw_counts))) < 1e-15)
+rm(eset_counts_)
+
+
+# ---- tcga_eset_batch_corrected.Rds ----
+tcga_eset_cor_ <- aws.s3::s3readRDS(
+  "tcga_eset_batch_corrected.Rds",
+  bucket = "UUID"
+)
+
+stopifnot(all(rownames(tcga_eset_cor_) == rownames(tcga_eset_cor)))
+stopifnot(all(colnames(tcga_eset_cor_) == colnames(tcga_eset_cor)))
+stopifnot(max(abs(exprs(tcga_eset_cor_) - exprs(tcga_eset_cor))) < 1e-15)
+rm(tcga_eset_cor_)
+```
+
+
+Number of genes used for the model: `r nrow(eset)`.
+
+Save.
+
+```{r "save vst model"}
+aws.s3::s3saveRDS(
+  vst_model,
+  "vst_model.Rds",
+  bucket = params$output_collection
+)
+
+```
+
+```{r "save batch-corrected Rds objects"}
+aws.s3::s3saveRDS(
+  eset_cor,
+  "eset_batch_corrected.Rds",
+  bucket = params$output_collection
+)
+
+aws.s3::s3saveRDS(
+  tpm_eset_full,
+  "tpm_eset.Rds",
+  bucket = params$output_collection
+)
+
+aws.s3::s3saveRDS(
+  eset_full_raw_counts,
+  "counts_eset.Rds",
+  bucket = params$output_collection
+)
+
+
+aws.s3::s3saveRDS(
+  tcga_eset_cor,
+  "tcga_eset_batch_corrected.Rds",
+  bucket = params$output_collection
+)
+```

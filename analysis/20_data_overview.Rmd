@@ -1,0 +1,627 @@
+---
+title: "Data overview"
+author: ""
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(RColorBrewer )
+library(gridExtra)
+library(kableExtra)
+library(DT)
+
+```
+
+```{r random seed}
+set.seed(42)
+
+addline_format <- function(x,...){
+    gsub('\\s','\n',x)
+}
+
+```
+
+Load ExpressionSet object.
+```{r load eset, message=FALSE, warning=FALSE, results='asis'}
+
+wd=getwd()
+eset <- aws.s3::s3readRDS("tpm_eset.Rds", bucket = params$output_collection)
+
+# removing the samples that do not have immune phenotype, that are part of the full dataset. 
+
+cat("Data without immune phenotype is excluded (here as FALSE):")
+kable( table(is.na(eset$CD8IMMPH)))
+
+eset <- eset[, !is.na(eset$CD8IMMPH)]
+
+  ### Prepping ematrix and annotation for
+  TPM = Biobase::exprs(eset)
+  pseudo=0.01
+  ematrix=data.matrix(log2(TPM+pseudo))
+
+  Design = Biobase::pData(eset) #sampleAnnot_complete.dt 
+  Annot = Biobase::fData(eset)
+  rownames(ematrix)=Annot$symbol; rm(TPM)
+  
+  # cleaning information 
+  # UROTHELIAL BLADDER CANCER	 == gRED
+  # BLADDER = pRED 
+  
+  # NSCLC = gRED
+  # LUNG = pRED
+
+  Design$INDICAT [ grep("BLADDER", Design$INDICAT) ] <- "BLADDER"
+
+  # Removing gRED studies
+  Design = Design[ ! Design$STUDYID %in% c("GO29293","GO28915","GO29294"), ]   # removed a total of 1395 samples
+
+  
+cat("Studies from gRED were removed: GO29293, GO28915,GO29294, to only contain new samples in the description area")
+cat("Total samples included")
+cat( nrow(Design))
+  
+# Including identifiers for full atezo annotation 
+Design <- Design %>%
+  rownames_to_column("A_SampleID")
+  
+# full information added here as extra_samples_annot, using rtbeda
+full_sample_anno <- aws.s3::s3read_using(
+  read_tsv,
+  show_col_types = FALSE,
+  object = "full_samples_anno.tsv",
+  bucket = params$data_collection
+)
+
+extra_samples_anno <- aws.s3::s3read_using(
+  read_tsv,
+  object = "extra_samples_anno.tsv",
+  bucket = params$data_collection
+)
+
+extra_samples_anno <- extra_samples_anno %>% filter( A_SampleID %in% Design$A_SampleID)
+
+#### Replace indication with with curated annotations
+ah_anno = read.table("../data/Indications_final.csv", sep=',',header=TRUE)
+tmpid=paste(sapply(full_sample_anno$USUBJID,function(x) strsplit(x,"-")[[1]][1]),sapply(full_sample_anno$USUBJID,function(x) strsplit(x,"-")[[1]][3]), sapply(full_sample_anno$SampleID,function(x) strsplit(x,"_")[[1]][2]),sep="_")
+
+tmpid2=paste(sapply(full_sample_anno$USUBJID,function(x) strsplit(x,"-")[[1]][1]),sapply(full_sample_anno$USUBJID,function(x) strsplit(x,"-")[[1]][3]),sep="_")
+
+full_sample_anno_ah=full_sample_anno
+full_sample_anno_ah$HA_Indication_Full=ah_anno[match(tmpid2,ah_anno$Study_Patient),"TumorDesc_Primary.Tumor.Diagnosis.Full.Text"]
+full_sample_anno_ah$HA_Indication=ah_anno[match(tmpid2,ah_anno$Study_Patient),"TumorDesc_Primary.Tumor.Diagnosis"]
+full_sample_anno_ah=full_sample_anno_ah[which(full_sample_anno_ah$A_SampleID%in%Design$A_SampleID),]
+
+#indcheck=table(paste(full_sample_anno_ah$INDICAT, full_sample_anno_ah$HA_Indication, sep="_"))
+#barplot(sort(indcheck,decreasing=TRUE)[1:40], las=2, cex.names=0.5)
+
+```
+
+# General information 
+
+```{r general stats, message=FALSE, warning=FALSE, results='asis'}
+
+cat("AGE, median -->")
+summary(extra_samples_anno$AGE)["Median"]
+
+cat("SEX -->")
+kable(table(extra_samples_anno$SEX))
+
+
+cat("VISIT_NAME -->")
+kable(table(extra_samples_anno$VISIT_NAME))
+
+cat("APCPI -->")
+kable(table(extra_samples_anno$APCPI))
+
+svg(paste(wd, "barplot_CPI_HA.svg", sep="/"), width = 3, height = 5)
+cpi=data.frame(CPI=names(table(extra_samples_anno$APCPI)),Nr=c(table(extra_samples_anno$APCPI)))
+ggplot(cpi, aes(x = "", y = Nr, fill=CPI)) +
+  geom_col()  
+dev.off()
+
+Design_full <- left_join(Design, 
+                    extra_samples_anno, 
+                    by="A_SampleID")
+
+Design_full <- left_join(Design_full, 
+                    full_sample_anno_ah[,c("A_SampleID","HA_Indication")], 
+                    by="A_SampleID")
+
+Design <- left_join(Design, 
+                    full_sample_anno_ah[,c("A_SampleID","HA_Indication")], 
+                    by="A_SampleID")
+
+
+### Take over the indications from curated table 
+Design_full$INDICAT=Design_full$HA_Indication
+
+Design$INDICAT=Design$HA_Indication
+write.table(Design,"../data/Design_indications_final.tsv", sep="\t",row.names=TRUE, col.names=TRUE, quote=FALSE)
+
+
+cat("Indicat -->")
+kable(table(Design_full$INDICAT))
+
+kable(Design_full %>% group_by( INDICAT, APCPI) %>% tally())
+
+kable(Design_full %>% group_by( HA_Indication, APCPI) %>% tally())
+
+#cat("LPCPID")
+#kable(table(extra_samples_anno$LPCPID))
+
+cat("LAPCPIN -->")
+kable(table(extra_samples_anno$LAPCPIN ))
+
+cat("DSTAGE (only indications with >5 entries per stage are displayed) -->")
+kable(Design_full %>% group_by( INDICAT, DSTAGE) %>% tally() %>% filter(n>5))
+
+#cat("Types of Lung cancer -->")
+#kable(table(Design %>% filter(INDICAT == "LUNG") %>% pull (HIST)))
+
+```
+# Overall indication distribution 
+
+* Indications with less than 5 samples not shown. Total samples `r nrow(Design)`
+
+```{r pies 1, fig.height=6, fig.width=8, fig.align="center", message=FALSE, warning=FALSE}
+
+tally_i = Design %>% group_by( INDICAT) %>% tally()
+pie_data_descend <- tally_i %>% filter (n > 5) %>% drop_na(INDICAT)
+#pie_data_descend <- pie_data_descend %>% arrange(-n)
+pie_data_descend$INDICAT <- ordered(pie_data_descend$INDICAT)
+pie_data_descend$INDICAT  <- ordered(pie_data_descend$INDICAT, levels = pie_data_descend %>% arrange(n) %>%pull(INDICAT))
+
+
+col_indicat = colorRampPalette(brewer.pal(8,"Dark2"))(length(unique(pie_data_descend$INDICAT)))
+names(col_indicat) = unique(pie_data_descend$INDICAT)     
+
+p1= ggplot(pie_data_descend, aes(x= INDICAT, y=n)) + 
+    geom_bar(stat="identity") + 
+    ggtitle("n samples per cancer type") +
+    coord_flip() +
+    scale_fill_manual(values=col_indicat )+
+    ylab("Number of samples") + xlab("Cancer type") + 
+    theme_bw()
+   
+p1 
+
+wd=getwd()
+svg(paste(wd, "barplot_indication_HA.svg", sep="/"), width = 8, height = 5)
+p1
+dev.off()
+
+
+tally_i = Design %>% group_by( INDICAT, CD8IMMPH) %>% tally()
+tally_i_Indlevel = Design %>% group_by( INDICAT) %>% tally()
+tally_i_Indlevel <- tally_i_Indlevel %>% filter (n > 5) %>% drop_na(INDICAT)
+
+## sort this part!
+tally_i_Indlevel2 <- tally_i_Indlevel %>% filter (n <= 5) %>% drop_na(INDICAT)
+
+#pie_data_descend <- tally_i %>% filter (n > 4) %>% drop_na(INDICAT)
+pie_data_descend <- tally_i %>% filter (INDICAT %in% tally_i_Indlevel$INDICAT) 
+
+pheno_col <- c(
+  INFLAMED = "#d95f02",
+  EXCLUDED = "#1b9e77",
+  DESERT = "#7570b3"
+)
+
+label_x = tally_i %>% group_by(INDICAT) %>% add_count(INDICAT, wt = n) %>% dplyr::select(INDICAT, nn) %>% distinct()
+label_x = label_x[ match( unique(pie_data_descend$INDICAT), label_x$INDICAT), ]
+label_x <- na.omit(label_x)
+label_x <- label_x %>% arrange(nn)
+
+pie_data_descend$INDICAT <- ordered(pie_data_descend$INDICAT)
+pie_data_descend$INDICAT  <- ordered(pie_data_descend$INDICAT, levels = label_x$INDICAT)
+
+label_x = paste(label_x$INDICAT, " (", label_x$nn, ")", sep="")
+
+p1= ggplot(pie_data_descend, aes(x=INDICAT, y=n, fill=CD8IMMPH)) + 
+    geom_bar(stat="identity") + 
+    ggtitle("n samples per cancer type") +
+    coord_flip() +
+    scale_fill_manual(values=pheno_col) +
+    ylab("Number of samples") + xlab("Cancer Type")+
+    scale_x_discrete(labels=addline_format(label_x) ) + 
+    theme_bw()
+   
+
+p1
+
+svg(paste(wd, "barplot_indication_CD8IMMPH_HA.svg", sep="/"), width = 8, height = 6)
+p1
+dev.off()
+ 
+
+```
+
+# Indication by location 
+
+Sorted by total freq: liver, lung, lymph node. Bars alphabetically ordered.
+
+```{r pies 2, fig.height=5, fig.width=20, fig.align="center"}
+
+# minimal sample size
+n_min = 5
+
+Design_i <- dplyr::filter(Design, grepl("ung",BMFLOC, ignore.case = TRUE))
+
+tally_i = Design_i %>% group_by( INDICAT) %>% tally()
+tally_i$perc <- round((tally_i$n*100)/sum(tally_i$n), digits = 1)
+pie_data_descend <- tally_i %>% filter (n > n_min) %>% drop_na(INDICAT)
+
+label_x = paste(pie_data_descend$INDICAT, " (", pie_data_descend$perc, "%)", sep="")
+
+p1 = ggplot(pie_data_descend, aes(x= INDICAT, y=n, fill=INDICAT)) + 
+    geom_bar(stat="identity") + 
+    ggtitle(paste("Lung (n=", sum(pie_data_descend$n), ")", sep="" )) +
+    coord_flip() +
+    scale_fill_manual(values=col_indicat[pie_data_descend$INDICAT], drop=FALSE )+
+    ylab("Number of samples") + xlab("Indication") + labs(caption = paste("", sep="")) +
+    theme(legend.position="none") +
+    scale_x_discrete(labels=addline_format(label_x) )+ 
+    theme_bw()
+
+
+####
+
+Design_i <- dplyr::filter(Design, grepl("iver",BMFLOC, ignore.case = TRUE))
+
+tally_i = Design_i %>% group_by( INDICAT) %>% tally()
+tally_i$perc <- round((tally_i$n*100)/sum(tally_i$n), digits = 1)
+pie_data_descend <- tally_i %>% filter (n > n_min) %>% drop_na(INDICAT)
+label_x = paste(pie_data_descend$INDICAT, " (", pie_data_descend$perc, "%)", sep="")
+
+p2 = ggplot(pie_data_descend, aes(x= INDICAT, y=n, fill=INDICAT)) + 
+    geom_bar(stat="identity") + 
+    ggtitle(paste("Liver (n=", sum(pie_data_descend$n), ")", sep="" )) +
+    coord_flip() +
+    scale_fill_manual(values=col_indicat[pie_data_descend$INDICAT], drop=FALSE )+
+    ylab("Number of samples") + xlab("Indication") + labs(caption = paste("", sep="")) +
+    theme(legend.position="none")+
+    scale_x_discrete(labels=addline_format(label_x) )+ 
+    theme_bw()
+
+#####
+
+Design_i <- dplyr::filter(Design, grepl("ymph",BMFLOC, ignore.case = TRUE))
+tally_i = Design_i %>% group_by( INDICAT) %>% tally()
+tally_i$perc <- round((tally_i$n*100)/sum(tally_i$n), digits =1)
+pie_data_descend <- tally_i %>% filter (n > n_min) %>% drop_na(INDICAT)
+label_x = paste(pie_data_descend$INDICAT, " (", pie_data_descend$perc, "%)", sep="")
+
+
+p3 = ggplot(pie_data_descend, aes(x= INDICAT, y=n, fill=INDICAT)) + 
+    geom_bar(stat="identity") + 
+    ggtitle(paste("Lymph node (n=", sum(pie_data_descend$n), ")", sep="" )) +
+    coord_flip() +
+    scale_fill_manual(values=col_indicat[pie_data_descend$INDICAT], drop=FALSE )+
+    ylab("Number of samples") + xlab("Indication") + labs(caption = paste("Only indications with >", n_min, " samples are shown", sep="")) +
+    theme(legend.position="none")+
+    scale_x_discrete(labels=addline_format(label_x) )+ 
+    theme_bw()
+
+
+grid.arrange(p1, p2, p3, nrow = 1)
+
+
+svg(paste(wd, "perTissue_HA.svg", sep="/"), width = 15, height = 4)
+grid.arrange(p1, p2, p3, nrow = 1)
+dev.off()
+
+```
+
+## Fisher test for CD8IMMPH and metastatic status
+
+* Is there higher relative fraction of CD8-desert phenotypes in liver metastases across all tumor types?
+
+```{r fisher mets, fig.height=5, fig.width=12, fig.align="center", message=FALSE, warning=FALSE}
+
+Design <- Design %>% mutate( METSorNOT = ifelse(STATUS == "Primary", "Primary", "Metastasis"))
+
+tmp = Design %>% filter(METSorNOT != "NA")
+tmp2 = table(tmp [,c("CD8IMMPH","METSorNOT")])
+
+kableExtra::kable(tmp2, caption = "Frequency table")
+
+print("2x3 Fisher test")
+fisher.test(tmp2, alternative = "two.sided")
+
+
+a=fisher.test(tmp2[-1, ], alternative = "two.sided")
+b=fisher.test(tmp2[-2, ], alternative = "two.sided")
+c=fisher.test(tmp2[-3, ], alternative = "two.sided")
+
+test_res= data.frame(comparison=c("Excluded_vs_Inflammed", "Desert_vs_Inflamed","Desert_vs_Excluded"), 
+                     pvalue= c(a$p.value, b$p.value, c$p.value), 
+                     odds_ratio = c(a$estimate, b$estimate, c$estimate))
+
+DT::datatable(test_res, caption = "Odds ratios by 2x2") %>%
+  formatRound(columns=c('pvalue', 'odds_ratio'), digits=5)
+
+cat("\n")
+cat("\n")
+```
+
+* There are some samples n= `r sum(is.na(Design$METSorNOT))`, that are NA in the STATUS because they do not have BFMLOC, so not possible to know whether they are primary or metastatic
+
+# Tumor by location and immphen
+
+```{r barplot 1, fig.height=5, fig.width=12, fig.align="center", message=FALSE, warning=FALSE}
+
+full_table <- data.frame()
+
+DT::datatable(Design_i %>% filter(STATUS == "Other Mets") %>% group_by(BMFLOC) %>% tally())
+
+pheno_col <- c(
+  INFLAMED = "#d95f02",
+  EXCLUDED = "#1b9e77",
+  DESERT = "#7570b3"
+)
+
+Design_i <- dplyr::filter(Design, grepl("UBC",INDICAT, ignore.case = TRUE))
+
+tally_i = Design_i %>% group_by(CD8IMMPH, STATUS) %>% tally()
+tally_i$STATUS <- factor(tally_i$STATUS, levels = c("Primary","Liver Mets","Lung Mets" ,"LN Mets" ,"Kidney Mets" ,"Colon Mets","HN Mets","Breast Mets","Ovarian Mets","Pancreas Mets","Other Mets") )
+
+tally_i <- na.omit(tally_i)
+to_other <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency <=4) %>% filter(grepl("Met",STATUS))
+tally_i[tally_i$STATUS%in%to_other$STATUS,"STATUS"]="Other Mets"
+to_keep <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency >4)
+tally_i <- tally_i %>% filter(STATUS %in% to_keep$STATUS)
+
+label_x = tally_i %>% group_by(STATUS) %>% add_count(STATUS, wt = n) %>% dplyr::select(STATUS, nn) %>% distinct()
+label_x = label_x[ match( levels(tally_i$STATUS), label_x$STATUS), ]
+label_x <- na.omit(label_x)
+label_x = paste(label_x$STATUS, " (", label_x$nn, ")", sep="")
+#label_x = label_x[c(6,2,4,3,1,5)]
+
+
+p1 = ggplot(tally_i, aes(fill= CD8IMMPH, y=n, x=STATUS)) + 
+    geom_bar(position="fill", stat="identity") + 
+    theme(legend.position="top") + 
+    ggtitle("UBC") +
+    labs(fill = "")+
+    scale_fill_manual(values=pheno_col) +
+    ylab("Frequency (%)") + xlab("") +
+    labs(caption = paste("Plot only lesions >5 samples, total samples=",sum(tally_i$n), sep=""))+
+    scale_x_discrete(labels=addline_format(label_x) ) +
+    theme_bw()
+
+
+full_table <- rbind( full_table, 
+                     tally_i %>% mutate(TumorExcision= "BLADDER"))
+
+# st=paste("total samples=",sum(tally_i$n) ,". Only mets from liver, lung, LN, kidney, colon, HN, breast, ovarian, pancreas are separated. All other are collapsed in other mets.", sep="")
+
+
+
+#####
+
+Design_i <- dplyr::filter(Design, grepl("NSCLC",INDICAT, ignore.case = TRUE))
+Design_i$STATUS[  which( grepl("LUNG", Design_i$BMFLOC))] = "Primary"
+Design_i$STATUS[  which( grepl("lung", Design_i$BMFLOC))] = "Primary"
+
+tally_i = Design_i %>% group_by(CD8IMMPH, STATUS) %>% tally()
+tally_i$STATUS <- factor(tally_i$STATUS, levels = c("Primary","Liver Mets","Lung Mets" ,"LN Mets" ,"Kidney Mets" ,"Colon Mets","HN Mets","Breast Mets","Ovarian Mets","Pancreas Mets","Other Mets") )
+
+tally_i <- na.omit(tally_i)
+to_other <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency <=4) %>% filter(grepl("Met",STATUS))
+tally_i[tally_i$STATUS%in%to_other$STATUS,"STATUS"]="Other Mets"
+to_keep <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency >4)
+tally_i <- tally_i %>% filter(STATUS %in% to_keep$STATUS)
+
+label_x = tally_i %>% group_by(STATUS) %>% add_count(STATUS, wt = n) %>% dplyr::select(STATUS, nn) %>% distinct()
+# primary, liver, lung, LN, kidney, other
+#label_x = label_x[c(5,2,3,1,4)]
+label_x = label_x[ match( levels(tally_i$STATUS), label_x$STATUS), ]
+label_x <- na.omit(label_x)
+label_x = paste(label_x$STATUS, " (", label_x$nn, ")", sep="")
+
+p2 = ggplot(tally_i, aes(fill= CD8IMMPH, y=n, x=STATUS)) + 
+    geom_bar(position="fill", stat="identity") + 
+    theme(legend.position="top") + 
+    ggtitle("NSCLC") +
+    labs(fill = "")+
+    scale_fill_manual(values=pheno_col) +
+    ylab("Frequency (%)") + xlab("") +
+    labs(caption = paste("Plot only lesions >=5 samples, total samples=",sum(tally_i$n) , sep="")) +
+    scale_x_discrete(labels=addline_format(label_x) ) +
+    theme_bw()  
+
+full_table <- rbind( full_table, 
+                     tally_i %>% mutate(TumorExcision= "LUNG"))
+
+#####
+
+Design_i <- dplyr::filter(Design, grepl("CRC",INDICAT, ignore.case = TRUE))
+Design_i$STATUS[  which( grepl("COLON", Design_i$BMFLOC))] = "Primary"
+
+tally_i = Design_i %>% group_by(CD8IMMPH, STATUS) %>% tally()
+tally_i$STATUS <- factor(tally_i$STATUS, levels = c("Primary","Liver Mets","Lung Mets" ,"LN Mets" ,"Kidney Mets" ,"Colon Mets","HN Mets","Breast Mets","Ovarian Mets","Pancreas Mets","Other Mets") )
+
+tally_i <- na.omit(tally_i)
+to_other <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency <=4) %>% filter(grepl("Met",STATUS))
+tally_i[tally_i$STATUS%in%to_other$STATUS,"STATUS"]="Other Mets"
+to_keep <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency >4)
+tally_i <- tally_i %>% filter(STATUS %in% to_keep$STATUS)
+
+label_x = tally_i %>% group_by(STATUS) %>% add_count(STATUS, wt = n) %>% dplyr::select(STATUS, nn) %>% distinct()
+# primary, liver, lung, LN, kidney, other
+#label_x = label_x[c(5,2,3,1,4)]
+label_x = label_x[ match( levels(tally_i$STATUS), label_x$STATUS), ]
+label_x <- na.omit(label_x)
+label_x = paste(label_x$STATUS, " (", label_x$nn, ")", sep="")
+
+p3 = ggplot(tally_i, aes(fill= CD8IMMPH, y=n, x=STATUS)) + 
+    geom_bar(position="fill", stat="identity") + 
+    theme(legend.position="top") + 
+    ggtitle("CRC") +
+    labs(fill = "")+
+    scale_fill_manual(values=pheno_col) +
+    ylab("Frequency (%)") + xlab("") +
+    labs(caption = paste("Plot only lesions >5 samples, total samples=",sum(tally_i$n) , sep="")) +
+    scale_x_discrete(labels=addline_format(label_x) ) + 
+    theme_bw()
+
+full_table <- rbind( full_table, 
+                     tally_i %>% mutate(TumorExcision= "COLORECTAL"))
+
+#####
+
+grid.arrange(p2, p3, p1, nrow = 1)
+
+
+
+svg(paste(wd, "perSTATUS_HA.svg", sep="/"), width = 15, height = 6)
+grid.arrange(p2, p3, p1, nrow = 1)
+dev.off()
+
+
+#####
+
+indic_i = "RCC"
+
+Design_i <- dplyr::filter(Design, grepl(indic_i,INDICAT, ignore.case = TRUE))
+Design_i$STATUS[  which( grepl(indic_i, Design_i$BMFLOC))] = "Primary"
+
+tally_i = Design_i %>% group_by(CD8IMMPH, STATUS) %>% tally()
+tally_i$STATUS <- factor(tally_i$STATUS, levels = c("Primary","Liver Mets","Lung Mets" ,"LN Mets" ,"Kidney Mets" ,"Colon Mets","HN Mets","Breast Mets","Ovarian Mets","Pancreas Mets","Other Mets") )
+
+tally_i <- na.omit(tally_i)
+to_other <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency <=4) %>% filter(grepl("Met",STATUS))
+tally_i[tally_i$STATUS%in%to_other$STATUS,"STATUS"]="Other Mets"
+
+to_keep <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency >4)
+tally_i <- tally_i %>% filter(STATUS %in% to_keep$STATUS)
+
+label_x = tally_i %>% group_by(STATUS) %>% add_count(STATUS, wt = n) %>% dplyr::select(STATUS, nn) %>% distinct()
+# primary, liver, lung, LN, kidney, other
+#label_x = label_x[c(5,2,3,1,4)]
+label_x = label_x[ match( levels(tally_i$STATUS), label_x$STATUS), ]
+label_x <- na.omit(label_x)
+label_x = paste(label_x$STATUS, " (", label_x$nn, ")", sep="")
+
+p4 = ggplot(tally_i, aes(fill= CD8IMMPH, y=n, x=STATUS)) + 
+    geom_bar(position="fill", stat="identity") + 
+    theme(legend.position="top") + 
+    ggtitle(paste(indic_i, sep=" ")) +
+    labs(fill = "")+
+    scale_fill_manual(values=pheno_col) +
+    ylab("Frequency (%)") + xlab("") +
+    labs(caption = paste("Plot only lesions >5 samples, total samples=",sum(tally_i$n) , sep="")) +
+    scale_x_discrete(labels=addline_format(label_x) ) + 
+    theme_bw()
+
+
+full_table <- rbind( full_table, 
+                     tally_i %>% mutate(TumorExcision= indic_i))
+
+#####
+
+#####
+
+indic_i = "HNC"
+
+Design_i <- dplyr::filter(Design, grepl(indic_i,INDICAT, ignore.case = TRUE))
+Design_i$STATUS[  which( grepl(indic_i, Design_i$BMFLOC))] = "Primary"
+
+tally_i = Design_i %>% group_by(CD8IMMPH, STATUS) %>% tally()
+tally_i$STATUS <- factor(tally_i$STATUS, levels = c("Primary","Liver Mets","Lung Mets" ,"LN Mets" ,"Kidney Mets" ,"Colon Mets","HN Mets","Breast Mets","Ovarian Mets","Pancreas Mets","Other Mets") )
+
+tally_i <- na.omit(tally_i)
+to_other <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency <=4) %>% filter(grepl("Met",STATUS))
+tally_i[tally_i$STATUS%in%to_other$STATUS,"STATUS"]="Other Mets"
+
+to_keep <- tally_i %>% group_by(STATUS) %>% summarise(Frequency = sum(n)) %>% filter(Frequency >4)
+tally_i <- tally_i %>% filter(STATUS %in% to_keep$STATUS)
+
+label_x = tally_i %>% group_by(STATUS) %>% add_count(STATUS, wt = n) %>% dplyr::select(STATUS, nn) %>% distinct()
+# primary, liver, lung, LN, kidney, other
+#label_x = label_x[c(5,2,3,1,4)]
+label_x = label_x[ match( levels(tally_i$STATUS), label_x$STATUS), ]
+label_x <- na.omit(label_x)
+label_x = paste(label_x$STATUS, " (", label_x$nn, ")", sep="")
+
+p5 = ggplot(tally_i, aes(fill= CD8IMMPH, y=n, x=STATUS)) + 
+    geom_bar(position="fill", stat="identity") + 
+    theme(legend.position="top") + 
+    ggtitle(paste(indic_i, sep=" ")) +
+    labs(fill = "")+
+    scale_fill_manual(values=pheno_col) +
+    ylab("Frequency (%)") + xlab("") +
+    labs(caption = paste("Plot only lesions >5 samples, total samples=",sum(tally_i$n) , sep="")) +
+    scale_x_discrete(labels=addline_format(label_x) ) + 
+    theme_bw()
+
+full_table <- rbind( full_table, 
+                     tally_i %>% mutate(TumorExcision= indic_i))
+
+
+
+DT::datatable(full_table %>% pivot_wider(names_from = CD8IMMPH, values_from = n) %>% relocate(TumorExcision), options=list(buttons=c('excel')))
+
+#####
+```
+
+
+```{r , fig.height=5, fig.width=20, fig.align="center", message=FALSE, warning=FALSE}
+
+
+svg(paste(wd, "perSTATUS_onlyKIDNEY_HN_HA.svg", sep="/"), width = 10, height = 5)
+grid.arrange(p4, p5, nrow = 1)
+dev.off()
+
+grid.arrange(p2, p3, p1, p4,p5, nrow = 1)
+
+svg(paste(wd, "perSTATUS_All_HA.svg", sep="/"), width = 25, height = 5)
+grid.arrange(p2, p3, p1, p4,p5, nrow = 1)
+dev.off()
+
+```
+
+
+
+# Tumor by studyID and indication 
+
+```{r barplot 2, fig.height=5, fig.width=12, fig.align="center", message=FALSE, warning=FALSE}
+
+Design_i <- Design
+
+# solve that primary vs all mets category is not present 
+
+tally_i = Design_i %>% group_by(STUDYID, INDICAT) %>% tally()
+pie_data_descend <- tally_i %>% filter (n > 5) %>% drop_na(INDICAT)
+
+label_x = tally_i %>% group_by(STUDYID) %>% add_count(STUDYID, wt = n) %>% dplyr::select(STUDYID, nn) %>% distinct()
+label_x = paste(label_x$STUDYID, " (", label_x$nn, ")", sep="")
+
+p1= ggplot(pie_data_descend, aes(fill= INDICAT, y=n, x=STUDYID)) + 
+    geom_bar(position="fill", stat="identity") + 
+    ggtitle("Indications per study") +
+    scale_fill_manual(values=colorRampPalette(brewer.pal(8,"Dark2"))(length(unique(pie_data_descend$INDICAT))) ) +
+    scale_x_discrete(labels=addline_format(label_x) ) +
+    ylab("Frequency (%)") + xlab("")+ 
+    theme_bw()
+
+p1
+
+svg(paste(wd, "Studies_per_indicat_HA.svg", sep="/"), width = 15, height = 6)
+p1
+dev.off()
+
+```

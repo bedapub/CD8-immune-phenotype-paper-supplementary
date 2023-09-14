@@ -1,0 +1,188 @@
+---
+title: "Feature distribution and model export"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  output_sharing_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+Goals:
+1. For features with non-zero coefficients we would like to save their
+  distribution for basic QC of input data.
+2. We would like to export the model w/o the mlr wrapper for easier reuse.
+
+```{r libs, message=FALSE, warning=FALSE}
+library(glmnet)
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+source("../src/pv.R")
+source("../src/density.R")
+```
+
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_train <- aws.s3::s3readRDS("eset_train.Rds", params$output_collection)
+eset_validation <- aws.s3::s3readRDS("eset_validation.Rds", params$output_collection)
+eset_test <- aws.s3::s3readRDS("eset_test.Rds", params$output_collection)
+eset_fake <- aws.s3::s3readRDS("eset_fake_counts.Rds", params$output_sharing_collection)
+```
+
+Load TCGA
+```{r}
+tcga_eset <- aws.s3::s3readRDS(
+  "tcga_eset_batch_corrected.Rds",
+  bucket = params$output_collection
+)
+```
+
+
+Combine ExpressionSet objects
+```{r "combine eset"}
+eset_trval <- BiocGenerics::combine(
+  eset_train,
+  eset_validation
+)
+
+stopifnot(nrow(eset_train) == nrow(eset_validation))
+stopifnot(nrow(eset_train) == nrow(eset_trval))
+stopifnot(ncol(eset_train) + ncol(eset_validation) == ncol(eset_trval))
+```
+
+
+Re-create tibbles for training.
+```{r "create training and test df"}
+dataset <- create_modeling_df(eset_trval)
+dataset_test <- create_modeling_df(eset_test)
+Biobase::exprs(eset_fake) <- DESeq2::vst(
+  Biobase::exprs(eset_fake)
+)
+dataset_fake <- create_modeling_df(eset_fake)
+```
+
+Model
+```{r}
+model <- aws.s3::s3readRDS(
+  object = "full_model.Rds",
+  bucket = params$output_collection
+)
+```
+
+Features
+```{r}
+features <- extr_glm_coef(model) %>%
+  filter(feature != "(Intercept)") %>%
+  pull(feature) %>%
+  unique()
+```
+
+
+```{r fig.width=10, fig.height=8}
+feature_values <- dataset %>%
+  select(all_of(features))
+
+feature_values %>%
+  pivot_longer(everything()) %>%
+  ggplot() +
+  aes(value) +
+  geom_histogram(aes(y = after_stat(density))) +
+  geom_density(bw = "SJ", col = "#ff202080") +
+  facet_wrap(~name, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+```{r}
+feature_values_sim <- feature_values %>%
+  map(simulate_from_density, 1e5) %>%
+  as_tibble()
+```
+
+
+Check that density does match
+```{r}
+bind_rows(
+  observed = feature_values,
+  sim = feature_values_sim,
+  .id = "type"
+) %>%
+  .[, 1:10] %>%
+  pivot_longer(-type) %>%
+  ggplot() +
+  aes(value, color = type, linetype = type) +
+  geom_density() +
+  facet_wrap(~ name, scales = "free_x") +
+  theme_bw()
+```
+
+Check if TCGA data matches the training dataset distribution
+```{r}
+model_genes <- model$selected_features()
+
+stopifnot(all(rownames(tcga_eset) == rownames(eset_train)))
+stopifnot(nrow(tcga_eset) == nrow(eset_train))
+Biobase::fData(tcga_eset)$symbol <- Biobase::fData(eset_train)$symbol
+tcga_eset$CD8IMMPH <- NA
+
+tcga_df <- create_modeling_df(tcga_eset)
+```
+
+
+```{r}
+reference <- feature_values_sim %>%
+  map(ecdf)
+ecdf_pvals(dataset, reference) %>%
+  summary()
+ecdf_pvals(dataset_fake, reference) %>%
+  summary()
+ecdf_pvals(dataset_test, reference) %>%
+  summary()
+ecdf_pvals(tcga_df, reference) %>%
+  summary()
+```
+
+```{r "save data into Rds object"}
+aws.s3::s3saveRDS(
+  feature_values_sim,
+  "feature_distribution.Rds",
+  bucket = params$output_sharing_collection
+)
+```
+
+```{r "export the glmnet model"}
+stopifnot(colnames(model$state$data_prototype)[1] == "IHC_Status")
+m <- list(
+  cnames = tail(colnames(model$state$data_prototype), -1),
+  model = model$state$model
+)
+
+aws.s3::s3saveRDS(
+  m,
+  "full_model_glmnet.Rds",
+  bucket = params$output_sharing_collection
+)
+```
+
+```{r, results="asis", echo=FALSE}
+reporting::print_reproducibility_section(params)
+```

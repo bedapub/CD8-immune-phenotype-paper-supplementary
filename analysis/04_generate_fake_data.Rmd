@@ -1,0 +1,112 @@
+---
+title: "Create fake data based on real data"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  output_sharing_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+Fake data is created by sampling expression of each gene from the real data.
+Data for Inflamed/Desert/Excluded classes is sampled from respective data substed.
+Data with "unknown" CD8 immune phenotype is sampled from all the data (with
+defined immune phenotypes).
+
+```{r libs, message=FALSE, warning=FALSE}
+library(Biobase)
+library(tidyverse)
+```
+
+```{r random seed}
+set.seed(42)
+```
+
+```{r "read raw counts"}
+raw_counts <- aws.s3::s3readRDS(
+  "counts_eset.Rds",
+  bucket = params$output_collection
+)
+raw_counts <- raw_counts[, !is.na(raw_counts$CD8IMMPH)]
+```
+
+```{r "save library size"}
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  exprs(raw_counts),
+  data.frame(row.names = colnames(raw_counts)),
+  ~1
+)
+dds <- DESeq2::estimateSizeFactors(dds)
+sf <- DESeq2::sizeFactors(dds)
+stopifnot(all(names(sf) == colnames(raw_counts)))
+raw_counts$deseq2_size_factor <- sf
+raw_counts$deseq2_size_factor_bin <- Hmisc::cut2(sf, g = 20)
+
+raw_counts %>%
+  as.data.frame() %>%
+  count(deseq2_size_factor_bin, CD8IMMPH) %>%
+  pull(n) %>%
+  min() -> min_n
+
+# we want each group to be large enough for anonymization reasons
+stopifnot(min_n >= 15)
+```
+
+```{r "sample fake data"}
+N_per_class <- 20
+
+set.seed(12)
+
+sampled <- tibble(
+  class = rep(c(unique(raw_counts$CD8IMMPH), NA), each = N_per_class)
+) %>%
+  mutate(
+    sf = sample(levels(raw_counts$deseq2_size_factor_bin), n(), replace = TRUE)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    dat = {
+      sel <- raw_counts$deseq2_size_factor_bin == sf &
+        !is.na(raw_counts$CD8IMMPH)
+      if (!is.na(class)) {
+        sel <- sel & raw_counts$CD8IMMPH == class
+      }
+      eset <- raw_counts[, sel]
+      # this is *much* faster than apply(eset, 1, sample, 1)
+      ind <- cbind(
+        seq_len(nrow(eset)),
+        sample(ncol(eset), nrow(eset), replace = TRUE)
+      )
+      list(exprs(eset)[ind])
+    }
+  ) %>%
+  mutate(id = ids::random_id(n(), bytes = 2, use_openssl = FALSE))
+
+m <- do.call(cbind, sampled$dat)
+colnames(m) <- sampled$id
+
+sampled_eset <- ExpressionSet(
+  m,
+  phenoData = AnnotatedDataFrame(
+    data = data.frame(row.names = sampled$id, CD8IMMPH = sampled$class)
+  ),
+  featureData = AnnotatedDataFrame(data = fData(raw_counts))
+)
+```
+
+```{r "save data into Rds object"}
+aws.s3::s3saveRDS(
+  sampled_eset,
+  "eset_fake_counts.Rds",
+  bucket = params$output_sharing_collection
+)
+```

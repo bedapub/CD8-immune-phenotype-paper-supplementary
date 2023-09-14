@@ -1,0 +1,93 @@
+---
+title: "Train model on full train data"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+```
+
+
+```{r "random seed"}
+# supposedly future should handle parallelization & random number generation properly
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_train <- aws.s3::s3readRDS("eset_train.Rds", params$output_collection)
+eset_validation <- aws.s3::s3readRDS("eset_validation.Rds", params$output_collection)
+sig_scores <- aws.s3::s3readRDS("sig_scores.Rds", params$output_collection)
+immune_genes <- aws.s3::s3read_using(
+  readLines,
+  object = "ImmuneGenes.tsv",
+  bucket = params$data_collection
+)
+```
+
+Create tibbles for training.
+```{r "create training df"}
+datasets <- list(
+  all_rnaseq = create_modeling_df(eset_train),
+  immune_rnaseq = create_modeling_df(eset_train, include_only_genes = immune_genes),
+  non_immune_rnaseq = create_modeling_df(eset_train, exclude_genes = immune_genes),
+  sc_scores = create_modeling_df(eset_train,
+    use_genes = FALSE, signatures = sig_scores, signature_namespace = "sc"
+  ),
+  hallmark_scores = create_modeling_df(eset_train,
+    use_genes = FALSE, signatures = sig_scores, signature_namespace = "hallmark"
+  ),
+  cancer_scores = create_modeling_df(eset_train,
+    use_genes = FALSE, signatures = sig_scores, signature_namespace = "cancer"
+  )
+)
+```
+
+
+Tasks
+```{r tasks}
+tasks <- imap(datasets, function(d, n) {
+  task <- TaskClassif$new(id = n, backend = d, target = "IHC_Status")
+  task$set_col_roles("IHC_Status", roles = c("target", "stratum"))
+  task
+})
+```
+
+Learner
+```{r learner}
+learner <- function() lrn("classif.cv_glmnet", alpha = 1, predict_type = "prob")
+```
+
+```{r "train models", include = FALSE, warning = FALSE, message = FALSE}
+models <- map(
+  tasks,
+  ~ learner()$train(.x)
+)
+```
+
+```{r "save models"}
+aws.s3::s3saveRDS(
+  models,
+  object = "train_models.Rds",
+  bucket = params$output_collection
+)
+```

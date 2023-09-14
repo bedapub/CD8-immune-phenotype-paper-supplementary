@@ -1,0 +1,92 @@
+---
+title: "Compute BioQC signatures"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+requireNamespace("Biobase")
+requireNamespace("BioQC")
+# require minimal BioQC version
+stopifnot(packageVersion("BioQC") >= package_version("1.21.2"))
+```
+
+We compute [BioQC](https://www.bioconductor.org/packages/release/bioc/html/BioQC.html) scores
+to use them later as sample features. Please note that BioQC scores are computed sample-by-samples,
+meaning that we are not leaking information between train & test datasets.
+
+Load ExpressionSet object. *Warning*: we are using non-corrected/not filtered TPMs for this.
+```{r load_eset}
+eset <- aws.s3::s3readRDS("tpm_eset.Rds", bucket = params$output_collection)
+```
+
+```{r load functions}
+source("../src/eset_transformation.R")
+```
+
+
+Load signatures.
+```{r load signatures}
+sigs <- list(
+  sc = "CellNames_scseqCMs6_sigs_for_Cd8.gmt",
+  cancer = "c4.cm.v7.4.symbols.gmt",
+  cancer = "c6.all.v7.4.symbols.gmt",
+  hallmark = "h.all.v7.4.symbols.gmt"
+) %>%
+  imap(~ aws.s3::s3read_using(BioQC::readGmt, namespace = .y,
+                              object = .x, bucket = params$data_collection)) %>%
+  flatten() %>%
+  BioQC::GmtList()
+```
+
+Compute BioQC scores.
+```{r bioqc compute}
+sig_scores <- BioQC::wmwTest(eset_symbol_matrix(eset),
+              sigs,
+              valType="r"
+)
+
+stopifnot(all(colnames(eset) == colnames(sig_scores)))
+stopifnot(all(rownames(sig_scores) == names(sigs)))
+stopifnot(nrow(sig_scores) == length(BioQC::gsNamespace(sigs)))
+
+rownames(sig_scores) <- str_c(BioQC::gsNamespace(sigs), "_", rownames(sig_scores))
+
+str(sig_scores)
+```
+
+```{r}
+ComplexHeatmap::Heatmap(sig_scores,
+                        cluster_rows=FALSE,
+                        cluster_columns=FALSE,
+                        show_row_names=FALSE,
+                        show_column_names=FALSE,
+                        left_annotation=ComplexHeatmap::rowAnnotation(
+                          namespace = rownames(sig_scores) %>% str_replace("_.*", "")
+                        )
+)
+```
+
+
+Save scores.
+```{r save}
+aws.s3::s3saveRDS(
+  sig_scores,
+  object = "sig_scores.Rds",
+  bucket = params$output_collection
+)
+```
+

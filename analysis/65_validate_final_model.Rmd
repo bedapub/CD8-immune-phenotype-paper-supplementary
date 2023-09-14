@@ -1,0 +1,262 @@
+---
+title: "Assess performance of the final model on the test dataset"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(glmnet)
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+source("../src/utils.R")
+source("../src/shiftlegend.R")
+```
+
+```{r}
+theme_set(theme_bw())
+```
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_test <- aws.s3::s3readRDS("eset_test.Rds", params$output_collection)
+eset_raw_counts <- aws.s3::s3readRDS(
+  "counts_eset.Rds",
+  bucket = params$output_collection
+)
+eset_raw_counts <- eset_raw_counts[, colnames(eset_test)]
+```
+
+```{r "compute vst"}
+vst_m <- DESeq2::vst(Biobase::exprs(eset_raw_counts))
+stopifnot(all(rownames(eset_raw_counts) == rownames(vst_m)))
+stopifnot(all(colnames(eset_raw_counts) == colnames(vst_m)))
+
+eset_test_vst <- eset_raw_counts
+Biobase::exprs(eset_test_vst) <- vst_m
+eset_test_vst <- eset_test_vst[rownames(eset_test), ]
+```
+
+Load models
+```{r "load model"}
+model <- aws.s3::s3readRDS(
+  object = "full_model.Rds",
+  bucket = params$output_collection
+)
+```
+
+```{r "get data source annotation"}
+full_sample_anno <- aws.s3::s3read_using(
+  read_tsv,
+  show_col_types = FALSE,
+  object = "full_samples_anno.tsv",
+  bucket = params$data_collection
+)
+```
+
+Create tibbles for validation
+```{r "create validation df"}
+dataset <- create_modeling_df(eset_test)
+dataset_vst <- create_modeling_df(eset_test_vst)
+```
+
+```{r predict}
+pred <- model$predict_newdata(dataset)
+pred_vst <- model$predict_newdata(dataset_vst)
+```
+
+```{r "compare probabilities with/without vst"}
+pm <- bind_rows(
+  normal = as.data.frame(pred$prob) %>% mutate(i = row_number()),
+  vst = as.data.frame(pred_vst$prob) %>% mutate(i = row_number()),
+  .id = "trans"
+) 
+
+pm %>%
+  pivot_longer(c(-i, -trans), names_to = "class", values_to = "prob") %>%
+  pivot_wider(names_from = "trans", values_from = "prob") %>%
+  ggplot(aes(normal, vst)) +
+  geom_point() +
+  facet_wrap(~class)
+
+table(pred$response,  pred_vst$response)
+
+table(pred$response,  pred_vst$response)/nrow(pred$prob) * 100
+```
+
+```{r}
+pred_df_vst <- as.data.table(pred_vst)
+pred_df_vst$A_SampleID <- colnames(eset_test)
+pred_df_vst <- left_join(
+  pred_df_vst,
+  select(full_sample_anno, A_SampleID, source=SOURCE, study=STUDYID),
+  by = "A_SampleID"
+)
+
+pred_df_vst %>%
+  pivot_longer(starts_with("prob."), names_prefix = "prob.", names_to = ".level", values_to = "prob") %>%
+  mutate(positive = as.factor(truth == .level)) %>%
+  group_by(.level) %>%
+  yardstick::roc_auc(positive, prob, event_level = "second") %>%
+  rename(AUC = .estimate, class = .level) %>%
+  select(class, AUC)
+```
+
+```{r "prepare performance dfs"}
+pred_df <- as.data.table(pred)
+pred_df$A_SampleID <- colnames(eset_test)
+pred_df <- left_join(
+  pred_df,
+  select(full_sample_anno, A_SampleID, source=SOURCE, study=STUDYID),
+  by = "A_SampleID"
+)
+```
+
+```{r "AUC data.frame"}
+auc_df <- pred_df %>%
+  pivot_longer(starts_with("prob."), names_prefix = "prob.", names_to = ".level", values_to = "prob") %>%
+  mutate(positive = as.factor(truth == .level)) %>%
+  group_by(.level) %>%
+  yardstick::roc_auc(positive, prob, event_level = "second") %>%
+  rename(AUC = .estimate, class = .level) %>%
+  select(class, AUC) %>%
+  mutate(AUC_text = str_glue("AUC={round(AUC, 3)}"))
+
+auc_source_df <- pred_df %>%
+  pivot_longer(starts_with("prob."), names_prefix = "prob.", names_to = ".level", values_to = "prob") %>%
+  mutate(positive = as.factor(truth == .level)) %>%
+  group_by(source, .level) %>%
+  yardstick::roc_auc(positive, prob, event_level = "second") %>%
+  rename(AUC = .estimate, class = .level) %>%
+  select(source, class, AUC) %>%
+  mutate(AUC_text = str_glue("AUC={round(AUC, 3)}"))
+```
+
+```{r "plot ROC"}
+p <- pred_df %>%
+  mutate(truth = factor(truth)) %>%
+  yardstick::roc_curve(truth, starts_with("prob.")) %>%
+  mutate(class = .level) %>%
+  ggplot() +
+  aes(x = 1 - specificity, y = sensitivity, col = class) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  geom_text(aes(label = AUC_text), x = 0.75, y = 0.25, data = auc_df, show.legend = FALSE) +
+  facet_wrap(~class, ncol = 2) +
+  scale_color_manual(values = pheno_col)
+p
+ggsave(here::here("figures/fig4b_final_auc.svg"))
+```
+
+```{r}
+p$layers[[3]]$aes_params$size <- 2.8
+p$layers[[3]]$aes_params$y <- 0.1
+p$layers[[3]]$aes_params$x <- 0.6
+p <- p +
+  theme(
+    text = element_text(size = 8),
+    legend.key.height = unit(3, "mm"),
+    #panel.background = element_rect(fill = "transparent"),
+    strip.background = element_rect(fill = "transparent"),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent"),
+    legend.key = element_rect(fill = "transparent"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave(
+  here::here("figures/fig4b_final_auc_poster.png"),
+  shift_legend(p),
+  width = 5, height = 5, units = "cm", dpi = 300, scale = 1.5,
+  bg = "transparent"
+)
+```
+
+```{r "plot ROC by source"}
+pred_df %>%
+  mutate(truth = factor(truth)) %>%
+  group_by(source) %>%
+  yardstick::roc_curve(truth, starts_with("prob.")) %>%
+  mutate(class = .level) %>%
+  ggplot() +
+  aes(x = 1 - specificity, y = sensitivity, col = class) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  geom_text(aes(label = AUC_text), x = 0.75, y = 0.25, data = auc_source_df, show.legend = FALSE) +
+  facet_wrap(~ source + class, ncol = 3) +
+  scale_color_manual(values = pheno_col)
+```
+
+Show AUCs as a table
+```{r "auc table"}
+auc_df %>%
+  select(-AUC_text) %>%
+  gt::gt()
+```
+
+Show AUCs as a table by source
+```{r "auc by source table"}
+auc_source_df %>%
+  select(-AUC_text) %>%
+  gt::gt()
+```
+
+
+```{r "export model coefficients"}
+extr_glm_coef(model) %>%
+  distinct(feature) %>%
+  filter(feature != "(Intercept)") %>%
+  {str_glue("Number of features in the final model: {nrow(.)}")} %>%
+  cat()
+extr_glm_coef(model) %>%
+  aws.s3::s3write_using(
+    write_tsv,
+    object = "features_final_model.tsv",
+    bucket = params$output_collection
+  )
+```
+
+Number of features per class
+```{r "number of features per class"}
+extr_glm_coef(model) %>%
+  filter(feature != "(Intercept)") %>%
+  count(class, name = "n_features") %>%
+  gt::gt()
+```
+Number of unique features per class
+```{r}
+extr_glm_coef(model) %>%
+  filter(feature != "(Intercept)") %>%
+  group_by(feature) %>%
+  filter(n() == 1) %>%
+  ungroup() %>%
+  count(class, name = "n_unique_features") %>%
+  gt::gt()
+```
+
+```{r results="asis", echo=FALSE}
+reporting::print_reproducibility_section(params)
+```
+

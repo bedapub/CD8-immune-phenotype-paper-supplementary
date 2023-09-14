@@ -1,0 +1,265 @@
+---
+title: "Visualize feature selection results"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(mlr3)
+library(tidyverse)
+library(glmnet)
+requireNamespace("ComplexHeatmap")
+requireNamespace("circlize")
+```
+
+```{r ggtheme}
+theme_set(theme_bw())
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+source("../src/mlr_plots.R")
+source("../src/utils.R")
+```
+
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_train <- aws.s3::s3readRDS("eset_train.Rds", params$output_collection)
+fs_res <- aws.s3::s3readRDS("model_selection_dt.Rds", params$output_collection)
+```
+
+Scores
+```{r "auc scores", message = FALSE}
+multi_aucs <- eset_train$CD8IMMPH %>%
+  str_to_lower() %>%
+  unique() %>%
+  map(~ multiclass_auc(.)$new()) %>%
+  set_names(map_chr(., ~ .x$id))
+
+multi_mcrs <- eset_train$CD8IMMPH %>%
+  str_to_lower() %>%
+  unique() %>%
+  set_names() %>%
+  map(~ multiclass_mcr(.)$new()) %>%
+  set_names(map_chr(., ~ .x$id))
+```
+
+```{r res_tab}
+auc_scores <- map(multi_aucs, ~ map_dbl(fs_res$prediction, .x$score)) %>%
+  set_names(map_chr(multi_aucs, ~ .x$id)) %>%
+  as.data.table()
+
+fs_res <- cbind(fs_res, auc_scores)
+```
+
+Plot AUCs
+```{r "auc plot"}
+fs_res %>%
+  select(c(starts_with("auc."))) %>%
+  pivot_longer(starts_with("auc."), names_to = "class", names_prefix = "auc.", values_to = "auc") %>%
+  ggplot(aes(class, auc, fill = class)) +
+  geom_boxplot() +
+  scale_fill_manual(values = pheno_col) +
+  labs(y = "AUC")
+
+ggsave(here::here("figures/auc_feature_selection.svg"))
+```
+
+Gene usage frequency
+```{r}
+coef_df <- fs_res %>%
+  select(iteration, coef) %>%
+  as_tibble() %>%
+  unnest(coef)
+
+
+full_sum <- coef_summary(coef_df)
+
+aws.s3::s3write_using(full_sum,
+  write_tsv,
+  object = "feature_summary.tsv",
+  bucket = params$output_collection
+)
+```
+
+```{r}
+full_sum %>%
+  ggplot(aes(n)) +
+  geom_histogram() +
+  facet_wrap(~class)
+```
+
+Pseudo volcano plot
+```{r}
+max_x <- full_sum %>%
+  pull(median_coef) %>%
+  abs() %>%
+  max() %>%
+  round(1)
+
+pseudo_volc_plot(full_sum, 0.90) +
+  ylim(0, 1.3) +
+  xlim(-max_x, max_x) +
+  theme(legend.position = "none")
+
+ggsave(here::here("figures/fig4c_pseudo_volcano_plot.svg"))
+```
+
+
+```{r "load local feature selection dataset"}
+fs_res_local <- readRDS(here::here("data/feature_selection_res.Rds")) %>%
+  as.data.table()
+```
+
+```{r "compare local results with saved ones", eval = FALSE, include = FALSE}
+x <- fs_res_local %>%
+  mutate(coef = map(fs_res_local$learner, extr_glm_coef)) %>%
+  select(-learner)
+
+auc_local_scores <- map(multi_aucs, ~ map_dbl(x$prediction, .x$score)) %>%
+  set_names(map_chr(multi_aucs, ~ .x$id)) %>%
+  as.data.table()
+
+x <- cbind(x, auc_local_scores)
+
+coef_local_df <- x %>%
+  select(iteration, coef) %>%
+  as_tibble() %>%
+  unnest(coef)
+
+summary(abs(coef_local_df$coef - coef_df$coef))
+# abs difference <4e-8
+```
+
+```{r "get_auc_lambdas"}
+acc <- msr("classif.acc")
+get_auc_lambdas <- function(task, resampling, iteration, learner) {
+  ind <- resampling$test_set(iteration)
+  tst_x <- task$data()[ind, ] %>%
+    select(-IHC_Status) %>%
+    as.matrix()
+  tst_y <- task$data()[ind, ] %>%
+    pull(IHC_Status)
+  mod <- learner$model
+  rsp <- predict(mod, newx = tst_x, type = "response", s = mod$lambda)
+  cls <- predict(mod, newx = tst_x, type = "class", s = mod$lambda)
+
+  cf <- coef(mod, s = mod$lambda)
+  nz <- cf %>%
+    reduce(`+`) %>%
+    {
+      . != 0
+    } %>%
+    colSums()
+  tibble(
+    iter = iteration,
+    lambda = mod$lambda,
+    pred = map(
+      seq_along(mod$lambda),
+      ~ PredictionClassif$new(
+        task = task,
+        row_ids = ind,
+        truth = tst_y,
+        prob = rsp[, , .x],
+        response = cls[, .x]
+      )
+    )
+  ) %>%
+    mutate(
+      map(multi_aucs, ~ map_dbl(pred, .x$score)) %>%
+        as_tibble(),
+      map(multi_mcrs, ~ map_dbl(pred, .x$score)) %>%
+        as_tibble(),
+      acc = map_dbl(pred, acc$score)
+    ) %>%
+    mutate(non_zero = nz) %>%
+    select(-pred)
+}
+```
+
+```{r "compute metrics for every cv iteration", message=FALSE, cache=TRUE}
+pb <- progress::progress_bar$new(total = nrow(fs_res_local), force = TRUE)
+auc_local <- map_dfr(
+  seq_len(nrow(fs_res_local)),
+  ~ {
+    pb$tick()
+    get_auc_lambdas(
+      fs_res_local$task[[.x]],
+      fs_res_local$resampling[[.x]],
+      fs_res_local$iteration[[.x]],
+      fs_res_local$learner[[.x]]
+    )
+  }
+)
+```
+
+Error rate versus number of parameters
+```{r "error rate plot"}
+set.seed(42)
+npar_errate <- auc_local %>%
+  sample_frac(0.1) %>%
+  mutate(error_rate = 1 - acc) %>%
+  ggplot() +
+  aes(non_zero, error_rate) +
+  geom_smooth(method = "loess") +
+  scale_x_log10(breaks = c(5, 10, 25, 50, 100, 200, 400)) +
+  scale_y_log10(breaks = scales::breaks_pretty(n = 10)) +
+  xlab("Number of model parameters") +
+  ylab("Error rate")
+
+print(npar_errate)
+
+ggsave(here::here("figures/feat_sel_n_par_errate.svg"))
+```
+
+```{r}
+set.seed(42)
+npar_auc <- auc_local %>%
+  pivot_longer(starts_with("auc."), names_prefix = "auc.", names_to="class", values_to = "auc") %>%
+  sample_frac(0.1) %>%
+  ggplot() +
+  aes(non_zero, auc, col=class) +
+  scale_color_manual(values = pheno_col) +
+  geom_smooth(method = "loess") +
+  scale_x_log10(breaks = c(5, 10, 25, 50, 100, 200, 400)) +
+  xlab("Number of model parameters") +
+  ylab("AUC")
+
+print(npar_auc)
+ggsave(here::here("figures/feat_sel_n_par_auc.svg"))
+```
+
+```{r}
+set.seed(42)
+auc_local %>%
+  pivot_longer(starts_with("mcr."), names_prefix = "mcr.", names_to="class", values_to = "mcr") %>%
+  sample_frac(0.1) %>%
+  ggplot() +
+  aes(non_zero, mcr, col=class) +
+  scale_color_manual(values = pheno_col) +
+  geom_smooth(method = "loess") +
+  scale_x_log10(breaks = c(5, 10, 25, 50, 100, 200, 400)) +
+  scale_y_log10(breaks = scales::breaks_pretty(n = 10)) +
+  xlab("Number of model parameters") +
+  ylab("Misclassification rate")
+
+ggsave(here::here("figures/feat_sel_n_par_mcr.svg"))
+```

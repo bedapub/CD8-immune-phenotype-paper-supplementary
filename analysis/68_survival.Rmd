@@ -1,0 +1,472 @@
+---
+title: "Survival plots based on immune phenotype and model prediction"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(survival)
+library(survminer)
+library(glmnet)
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+source("../src/utils.R")
+```
+
+```{r}
+theme_set(theme_bw())
+```
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset <- aws.s3::s3readRDS("eset_batch_corrected.Rds", params$output_collection)
+eset_tpm <- aws.s3::s3readRDS("tpm_eset.Rds", params$output_collection)
+```
+
+Compute T eff signature
+```{r "compute t eff signature"}
+t_eff <- c(
+  "CD3E",
+  "CD8A",
+  "CXCL10",
+  "CXCL9",
+  "EOMES",
+  "GZMA",
+  "GZMB",
+  "IFNG",
+  "KLRD1",
+  "NKG7",
+  "PRF1",
+  "TBX21"
+)
+t_eff_geneids <- Biobase::fData(eset_tpm) %>%
+  rownames_to_column("GeneID") %>%
+  filter(symbol %in% t_eff) %>%
+  {
+    set_names(.$GeneID, .$symbol)
+  }
+
+sign <- BioQC::GmtList(list(t_eff = list(name = "t_eff", desc = "t_eff", genes = t_eff)))
+
+sig_scores <- BioQC::wmwTest(eset_symbol_matrix(eset_tpm),
+  sign,
+  valType = "r"
+)
+
+
+
+
+sig_scores <- tibble(A_SampleID = names(sig_scores), t_eff = sig_scores)
+sig_scores$CD8A <- Biobase::exprs(eset_tpm[t_eff_geneids["CD8A"], ])[, sig_scores$A_SampleID]
+sig_scores$t_eff_tpm <- eset_tpm[t_eff_geneids, ] %>%
+  Biobase::exprs() %>%
+  colSums() %>%
+  {
+    .[sig_scores$A_SampleID]
+  }
+```
+
+
+Load models
+```{r "load model"}
+model <- aws.s3::s3readRDS(
+  object = "full_model.Rds",
+  bucket = params$output_collection
+)
+```
+
+```{r "get data source annotation"}
+full_sample_anno <- aws.s3::s3read_using(
+  read_tsv,
+  show_col_types = FALSE,
+  object = "full_samples_anno.tsv",
+  bucket = params$data_collection
+)
+```
+
+Create tibbles for validation
+```{r "create validation df"}
+dataset <- create_modeling_df(eset)
+```
+
+```{r predict}
+pred <- model$predict_newdata(dataset)
+```
+
+```{r "prepare performance dfs"}
+pred_df <- as.data.table(pred)
+pred_df$A_SampleID <- colnames(eset)
+pred_df <- left_join(
+  pred_df,
+  select(full_sample_anno, A_SampleID, source = SOURCE, study = STUDYID),
+  by = "A_SampleID"
+)
+pred_df$truth <- fct_relevel(pred_df$truth, names(pheno_col))
+pred_df$response <- fct_relevel(pred_df$response, names(pheno_col))
+pred_df <- left_join(
+  pred_df,
+  sig_scores,
+  by = "A_SampleID"
+)
+pred_df$logit.inflamed <- with(pred_df, log(prob.inflamed / (1 - prob.inflamed)))
+```
+
+# Survival plots {.tabset .tabset-pills}
+```{r "CD8 imm phe OS dataset"}
+os_data <- filter(full_sample_anno, !is.na(OS) & !is.na(ARM)) %>%
+  left_join(pred_df, by = "A_SampleID") %>%
+  rename(prediction = response)
+
+# Censoring Status Value(1=cens,0=evt)
+# https://drive.google.com/file/d/11oG4_rXtEzBkJmWC9x009Z_JIIga1uMc/view
+os_data$event <- if_else(os_data$CNSR_OS == 1, 0, 1)
+
+os_data$atezo <- if_else(str_detect(os_data$ARM, fixed("MPDL3280A")), TRUE, FALSE)
+```
+
+```{r}
+study_names <- c(
+  "GO29293" = "IMvigor 210",
+  "GO28915" = "OAK",
+  "GO29294" = "IMvigor 211"
+)
+```
+
+
+```{r "survplot_study"}
+survplot_dataset <- function(os_data, fit, atezo) {
+  pal <- unname(pheno_col[levels(os_data$truth)])
+  ggsurvplot(fit,
+    data = os_data, risk.table = TRUE, risk.table.height = 0.25,
+    palette = pal,
+    conf.int = TRUE,
+    title = if (!is.na(atezo)) str_glue("atezo={atezo}") else ""
+  )
+}
+
+survplot_studies <- function(os_data) {
+  frm1 <- Surv(OS, event) ~ truth
+  frm2 <- Surv(OS, event) ~ prediction
+  d <- os_data %>%
+    group_by(study, atezo) %>%
+    nest()
+  d$fit_truth <- surv_fit(frm1, d$data)
+  d$fit_prediction <- surv_fit(frm2, d$data)
+  d <- d %>%
+    pivot_longer(starts_with("fit_"), names_prefix = "fit_", names_to = "model", values_to = "fit")
+
+  d <- d %>%
+    group_by(study, model) %>%
+    mutate(n_atezo = length(unique(atezo))) %>%
+    ungroup()
+  d <- d %>%
+    mutate(atezo = if_else(n_atezo == 1, NA, atezo))
+  d$plt <- pmap(d, function(data, fit, atezo, ...) survplot_dataset(data, fit, atezo))
+  d
+}
+
+plots <- survplot_studies(os_data)
+```
+
+```{r}
+oak_atezo_data <- os_data %>%
+  filter(
+    study == names(study_names)[study_names == "OAK"],
+    atezo == TRUE
+  ) 
+oak_atezo_fit <-
+  surv_fit(Surv(OS, event) ~ prediction, oak_atezo_data)
+
+{
+  svg(
+    here::here("figures/fig6c2_oak_survival_plot.svg"),
+    width = 7.5,
+    height = 6
+  )
+  survplot_dataset(oak_atezo_data, oak_atezo_fit, NA) %>%
+    print(newpage = FALSE)
+  dev.off()
+}
+```
+
+```{r fig}
+pal <- unname(pheno_col[levels(oak_atezo_data$truth)])
+thm <-  theme(
+  text = element_text(size = 16),
+  legend.key.height = unit(3, "mm"),
+  panel.background = element_rect(fill = "transparent"),
+  strip.background = element_rect(fill = "transparent"),
+  plot.background = element_rect(fill = "transparent", color = NA),
+  legend.background = element_rect(fill = "transparent"),
+  legend.key = element_rect(fill = "transparent"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank()
+)
+oak_atezo_fit_tmp <- oak_atezo_fit
+names(oak_atezo_fit_tmp$strata) <- 
+  str_replace(names(oak_atezo_fit_tmp$strata), ".*=", "")
+{
+  svg(
+    here::here("figures/fig6c2_oak_survival_plot_poster.svg"),
+    width = 4.5,
+    height = 4.5
+  )
+  ggsurvplot(oak_atezo_fit_tmp,
+    data = oak_atezo_data, risk.table = TRUE, risk.table.height = .35,
+    palette = pal,
+    conf.int = TRUE,
+    ggtheme = thm
+  ) %>%
+    print(newpage = FALSE)
+  dev.off()
+}
+```
+
+
+```{r "os plots", fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+for (s in unique(plots$study)) {
+  cat(str_glue("## {s} ({study_names[s]}) {{.tabset .tabset-pills}}\n\n", trim = FALSE))
+  cat(str_glue("### truth {{.tabset .tabset-pills}}\n\n", trim = FALSE))
+  d <- filter(plots, study == s & model == "truth")
+  for (a in d$atezo) {
+    if (!is.na(a)) {
+      dd <- filter(d, atezo == a)
+      cat(str_glue("#### atezo={a} {{.tabset .tabset-pills}}\n\n", trim = FALSE))
+    } else {
+      dd <- d
+    }
+    dd$plt %>% walk(print)
+    cat("\n\n")
+  }
+
+  cat(str_glue("### prediction {{.tabset .tabset-pills}}\n\n", trim = FALSE))
+  d <- filter(plots, study == s & model == "prediction")
+  for (a in d$atezo) {
+    if (!is.na(a)) {
+      dd <- filter(d, atezo == a)
+      cat(str_glue("#### atezo={a} {{.tabset .tabset-pills}}\n\n", trim = FALSE))
+    } else {
+      dd <- d
+    }
+    dd$plt %>% walk(print)
+    cat("\n\n")
+  }
+}
+```
+
+
+## OAK plots {.tabset .tabset-pills}
+
+```{r "prepare OS data OAK"}
+os_data_oak <- filter(os_data, study == names(study_names)[study_names == "OAK"])
+os_data_oak$t_eff_high <- os_data_oak$t_eff > median(os_data_oak$t_eff)
+os_data_oak$t_eff_sum_high <- os_data_oak$t_eff_tpm > median(os_data_oak$t_eff_tpm)
+os_data_oak$cd8a_high <- os_data_oak$CD8A > median(os_data_oak$CD8A)
+os_data_oak$predicted_inflamed <- os_data_oak$prediction == "inflamed"
+os_data_oak$truth_inflamed <- os_data_oak$truth == "inflamed"
+os_data_oak$predicted_inflamed_subset <- if_else(
+  is.na(os_data_oak$truth_inflamed),
+  NA,
+  os_data_oak$predicted_inflamed
+)
+
+plot_os_oak <- function(data, response, include_atezo) {
+  data <- data[data$atezo == include_atezo, ]
+  frm <- as.formula(str_c("Surv(OS, event) ~ ", response))
+  fit <- surv_fit(frm, data = data)
+  ggsurvplot(fit,
+    title = str_glue("atezo={include_atezo}"),
+    data = data, risk.table = TRUE, risk.table.height = 0.25,
+    conf.int = TRUE
+  )
+}
+```
+
+
+### Predicted inflamed, atezo arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "predicted_inflamed", TRUE)
+```
+
+### Predicted inflamed, docetaxel arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "predicted_inflamed", FALSE)
+```
+
+### Predicted inflamed (subset with truth), atezo arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "predicted_inflamed_subset", TRUE)
+```
+
+### Predicted inflamed (subset with truth), docetaxel arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "predicted_inflamed_subset", FALSE)
+```
+
+### Truth inflamed, atezo arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "truth_inflamed", TRUE)
+```
+
+### Truth inflamed, docetaxel arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "truth_inflamed", FALSE)
+```
+
+### T effector high, atezo arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "t_eff_high", TRUE)
+```
+
+### T effector high, docetaxel arm
+```{r fig.width=7, fig.height=6, warning=FALSE, results="asis"}
+plot_os_oak(os_data_oak, "t_eff_high", FALSE)
+```
+
+
+### Forest plots
+```{r fig.width=8, fig.height=3}
+fit_to_df <- function(f, d) {
+  s <- summary(f)
+  tibble(
+    HR = s$conf.int[, "exp(coef)"],
+    HR_lower = s$conf.int[, "lower .95"],
+    HR_upper = s$conf.int[, "upper .95"],
+    n = s$n,
+    n_events = s$nevent
+  )
+}
+
+
+coxph_models <- crossing(
+  arm = c("atezo", "docetaxel"),
+  response = c("predicted_inflamed", "predicted_inflamed_subset", "truth_inflamed", "t_eff_high")
+) %>%
+  mutate(response_label = case_when(
+    response == "predicted_inflamed" ~ "Predicted: inflamed",
+    response == "predicted_inflamed_subset" ~ "Predicted: inflamed (subset)",
+    response == "truth_inflamed" ~ "Truth: inflamed",
+    response == "t_eff_high" ~ "T effector high")) %>%
+  rowwise() %>%
+  mutate(
+    data = list(os_data_oak[os_data_oak$atezo == (arm == "atezo"), ]),
+    fit = list(
+      survival::coxph(as.formula(str_c("Surv(OS, event) ~ ", response)),
+        data = data
+      )
+    ),
+    fit_summary = list(fit_to_df(fit))
+  ) %>%
+  unnest(fit_summary)
+
+m <- with(coxph_models, meta::metagen(log(HR),
+  lower = log(HR_lower), upper = log(HR_upper),
+  sm = "HR",
+  studlab = str_glue("ARM {arm} (N={n}), {response_label}"),
+  data = coxph_models
+))
+
+
+meta::forest(m,
+  xlim = c(0.5, 2), pooled.totals = TRUE, lab.e = "events",
+  overall = FALSE,
+  leftlabs = c(""), leftcols = "studlab",
+  hetstat = FALSE,
+)
+```
+
+```{r fig.width=8, fig.height=3}
+# only predicted
+
+m <- coxph_models %>%
+  filter(response %in% c("predicted_inflamed")) %>%
+  with(., meta::metagen(log(HR),
+  lower = log(HR_lower), upper = log(HR_upper),
+  sm = "HR",
+  studlab = str_glue("ARM {arm} (N={n}), {response_label}"),
+  data = .
+))
+
+meta::forest(m,
+  xlim = c(0.5, 2), pooled.totals = TRUE, lab.e = "events",
+  overall = FALSE,
+  leftlabs = c(""), leftcols = "studlab",
+  hetstat = FALSE,
+)
+{
+  svg(
+    here::here("figures/fig6c1_oak_survival_forest.svg"),
+    width = 8,
+    height = 2.1
+  )
+  meta::forest(m,
+    xlim = c(0.5, 2), pooled.totals = TRUE, lab.e = "events",
+    overall = FALSE,
+    leftlabs = c(""), leftcols = "studlab",
+    hetstat = FALSE,
+  )
+  dev.off()
+}
+```
+
+# Correlation between inflamed probability and T effector signature scores
+```{r "correlation between inflamed probability and T eff"}
+ggplot(pred_df) +
+  aes(prob.inflamed, t_eff, col = truth) +
+  geom_point() +
+  scale_color_manual(values = pheno_col) +
+  ggtitle("Full dataset") +
+  guides(color = guide_legend(title = "CD8 immune phenotype"))
+
+pred_df %>%
+  filter(study == "GO28915") %>%
+  ggplot() +
+  aes(prob.inflamed, t_eff, col = truth) +
+  geom_point() +
+  scale_color_manual(values = pheno_col) +
+  ggtitle("OAK") +
+  guides(color = guide_legend(title = "CD8 immune phenotype"))
+```
+
+```{r "boxplot of T effector vs prediction"}
+pred_df %>%
+  ggplot(aes(t_eff, response, fill = response)) +
+  geom_boxplot()
+```
+
+TPMs below are log2 transformed (with pseudocount).
+```{r "correlate T effector to inflamed probability"}
+pred_df %>%
+  select(logit.inflamed, CD8A, t_eff, t_eff_tpm) %>%
+  mutate(CD8A = log2(CD8A + 1), t_eff_tpm = log2(t_eff_tpm + 1)) %>%
+  GGally::ggpairs(
+    progress = FALSE,
+    upper = list(continuous = "density"),
+    lower = list(continuous = GGally::wrap("points", alpha = 0.1))
+  )
+```
+
+```{r, results="asis", echo=FALSE}
+reporting::print_reproducibility_section(params)
+```

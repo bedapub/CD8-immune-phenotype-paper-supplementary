@@ -1,0 +1,604 @@
+---
+title: "Apply model to TCGA"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(mlr3verse)
+library(glmnet)
+library(RTCGA.clinical)
+library(Biobase)
+```
+
+```{r ggtheme}
+theme_set(theme_bw())
+```
+
+
+```{r}
+source("../src/eset_transformation.R")
+source("../src/utils.R")
+```
+
+```{r}
+theme_set(theme_bw())
+```
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load models
+```{r "load model"}
+model <- aws.s3::s3readRDS(
+  object = "full_model.Rds",
+  bucket = params$output_collection
+)
+```
+
+```{r "load tcga and roche data"}
+tcga_eset <- aws.s3::s3readRDS(
+  "tcga_eset_batch_corrected.Rds",
+  bucket = params$output_collection
+)
+eset_train <- aws.s3::s3readRDS(
+  "eset_train.Rds",
+  params$output_collection
+)
+```
+
+
+Check feature distribution
+```{r "feature correspondance"}
+model_genes <- model$selected_features()
+
+stopifnot(all(rownames(tcga_eset) == rownames(eset_train)))
+stopifnot(nrow(tcga_eset) == nrow(eset_train))
+fData(tcga_eset)$symbol <- fData(eset_train)$symbol
+tcga_eset$CD8IMMPH <- NA
+
+tcga_df <- create_modeling_df(tcga_eset)
+```
+
+```{r}
+eset_rows_to_use <- fData(eset_train)$symbol %in% model_genes
+stopifnot(eset_rows_to_use == fData(tcga_eset)$symbol %in% model_genes)
+eset_m <- exprs(eset_train)[eset_rows_to_use, ]
+tcga_m <- exprs(tcga_eset)[eset_rows_to_use, ]
+
+stopifnot(nrow(eset_m) == nrow(tcga_m))
+```
+
+Heatmap
+```{r "heatmap", fig.width=8, fig.height=8}
+m <- cbind(eset_m, tcga_m)
+rownames(m) <- fData(eset_train)$symbol[eset_rows_to_use]
+
+cannot <- ComplexHeatmap::columnAnnotation(
+  dataset = c(rep("train", ncol(eset_m)), rep("TCGA", ncol(tcga_m))),
+  IHC_Status = c(str_to_lower(eset_train$CD8IMMPH), rep(NA, ncol(tcga_m))),
+  col = list(IHC_Status = pheno_col),
+  study = c(rep(NA, ncol(eset_m)), tcga_eset$study)
+)
+
+ComplexHeatmap::Heatmap(m,
+  top_annotation = cannot,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  cluster_columns = FALSE
+)
+```
+
+# Predicting for TCGA
+```{r}
+pred <- model$predict_newdata(select(tcga_df, -IHC_Status))
+tcga_eset$CD8IMMPH_pred <- pred$response
+```
+
+# Prediction distribution per indication
+```{r}
+tcga_eset_summary <- pData(tcga_eset) %>%
+  select(study, CD8IMMPH_pred) %>%
+  group_by(study) %>%
+  mutate(prop_inflamed = sum(CD8IMMPH_pred == "inflamed") / n(), count = n()) %>%
+  ungroup() %>%
+  mutate(study = fct_reorder(study, -prop_inflamed))
+
+p <- tcga_eset_summary %>%
+  ggplot() +
+  aes(study, fill = CD8IMMPH_pred) +
+  geom_bar(position = "fill") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  scale_fill_manual(values = pheno_col, name = "predicted phenotype") +
+  geom_text(aes(label = count, x = study, fill = NULL),
+    data = distinct(tcga_eset_summary, study, count),
+    y = 1.01, angle = 90, hjust = 0
+  ) +
+  ylim(0, 1.09) +
+  ylab("proportion")
+p
+
+ggsave(here::here("figures/tcga_predicted.svg"))
+
+```
+
+```{r}
+p$layers[[2]]$aes_params$size <- 2
+p$layers[[2]]$aes_params$y <- 1.02 
+p$coordinate
+p <- p +
+  theme(
+    text = element_text(size = 6),
+    legend.key.height = unit(3, "mm"),
+    #panel.background = element_rect(fill = "transparent"),
+    strip.background = element_rect(fill = "transparent"),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent"),
+    legend.key = element_rect(fill = "transparent"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.box.margin=margin(-11,-11,-11,-11)
+  ) +
+  ylim(0, 1.25)
+ggsave(
+  here::here("figures/tcga_predicted_poster.png"),
+  p,
+  width = 7, height = 5, units = "cm", dpi = 300, scale = 1,
+  bg = "transparent"
+)
+```
+
+## Table
+```{r}
+tcga_eset_summary %>%
+  group_by(study) %>%
+  count(CD8IMMPH_pred) %>%
+  mutate(prc = round(100 * n / sum(n), 1)) %>%
+  pivot_wider(
+    names_from = CD8IMMPH_pred,
+    values_from = c(n, prc),
+    values_fill = 0
+  ) %>%
+  arrange(-prc_inflamed, -prc_excluded, -prc_inflamed) %>%
+  gt::gt()
+```
+
+
+# Survival analysis
+```{r}
+# https://github.com/RTCGA/RTCGA/issues/97#data-preparation
+TCGA_surv <- survivalTCGA(
+  ACC.clinical,
+  BLCA.clinical,
+  BRCA.clinical,
+  CESC.clinical,
+  CHOL.clinical,
+  COAD.clinical,
+  COADREAD.clinical,
+  DLBC.clinical,
+  ESCA.clinical,
+  FPPP.clinical,
+  GBM.clinical,
+  GBMLGG.clinical,
+  HNSC.clinical,
+  KICH.clinical,
+  KIPAN.clinical,
+  KIRC.clinical,
+  KIRP.clinical,
+  LAML.clinical,
+  LGG.clinical,
+  LIHC.clinical,
+  LUAD.clinical,
+  LUSC.clinical,
+  MESO.clinical,
+  OV.clinical,
+  PAAD.clinical,
+  PCPG.clinical,
+  PRAD.clinical,
+  READ.clinical,
+  SARC.clinical,
+  SKCM.clinical,
+  STAD.clinical,
+  STES.clinical,
+  TGCT.clinical,
+  THCA.clinical,
+  THYM.clinical,
+  UCEC.clinical,
+  UCS.clinical,
+  UVM.clinical
+)
+
+tcga_subset <- tcga_eset[
+  ,
+  !is.na(tcga_eset$tcga.xml_bcr_patient_barcode) &
+    !is.na(tcga_eset$tcga.cgc_sample_sample_type) &
+    tcga_eset$tcga.xml_bcr_patient_barcode %in% TCGA_surv$bcr_patient_barcode &
+    tcga_eset$tcga.cgc_sample_sample_type == "Primary Tumor"
+]
+tcga_subset_pred <- pData(tcga_subset) %>%
+  select(tcga.xml_bcr_patient_barcode, CD8IMMPH_pred, cohort = study)
+
+TCGA_surv_imm_phe <- TCGA_surv %>%
+  inner_join(tcga_subset_pred, by = c("bcr_patient_barcode" = "tcga.xml_bcr_patient_barcode")) %>%
+  rename(time = times, event = patient.vital_status)
+
+table(TCGA_surv_imm_phe$cohort, useNA = "always")
+```
+
+```{r "survival plots", message=FALSE, warning=FALSE}
+survplots <- unique(TCGA_surv_imm_phe$cohort) %>%
+  set_names() %>%
+  map(
+    ~ RTCGA::kmTCGA(
+      filter(TCGA_surv_imm_phe, cohort == .x),
+      times = "time",
+      status = "event",
+      explanatory.names = c("CD8IMMPH_pred", "cohort"),
+      pval = TRUE,
+      conf.int = FALSE,
+      xlim = c(0, 4000)
+    )
+  )
+```
+
+## KM plots {.tabset .tabset-pills}
+```{r fig.width=10, fig.height=8, results="asis"}
+survplots %>%
+  iwalk(function(p, n) {
+    cat(str_c("### ", n, "\n\n"))
+    print(p)
+    cat("\n\n")
+  })
+```
+
+## Forest plot
+
+We only consider samples predicted to be inflamed and desert.
+
+```{r}
+fits_to_df <- function(l, d) {
+  imap_dfr(l,
+    function(f, co) {
+      n_class <- d %>%
+        filter(cohort == co) %>%
+        count(CD8IMMPH_pred) %>%
+        pivot_wider(names_from = CD8IMMPH_pred, names_prefix = "n_", values_from = n, values_fill = 0)
+      s <- summary(f)
+      tibble(
+        HR = s$conf.int[, "exp(coef)"],
+        HR_lower = s$conf.int[, "lower .95"],
+        HR_upper = s$conf.int[, "upper .95"],
+        n = s$n,
+        n_events = s$nevent
+      ) %>%
+        bind_cols(n_class)
+    },
+    .id = "cohort"
+  )
+}
+
+fit_tcga <- function(iphe, d) {
+  large_cohorts <- d %>%
+    distinct(bcr_patient_barcode, cohort, CD8IMMPH_pred) %>%
+    count(cohort, CD8IMMPH_pred) %>%
+    pivot_wider(names_from = CD8IMMPH_pred, values_from = n, values_fill = 0) %>%
+    filter(inflamed > 10, desert > 10)
+
+  large_cohorts <- d %>%
+    group_by(cohort) %>%
+    filter(event == 1) %>%
+    tally() %>%
+    filter(n > 15) %>%
+    inner_join(large_cohorts, by = "cohort")
+
+  fits <- unique(large_cohorts$cohort) %>%
+    set_names() %>%
+    map(
+      function(co) {
+        survival::coxph(survival::Surv(time, event) ~ CD8IMMPH_pred == iphe,
+          subset = cohort == co,
+          data = d
+        )
+      }
+    )
+}
+
+tcga_forest_plot <- function(d, iphe) {
+  mod_df <- fit_tcga(iphe, d) %>%
+    fits_to_df(d)
+  m <- with(mod_df, meta::metagen(log(HR),
+    lower = log(HR_lower), upper = log(HR_upper),
+    studlab = str_glue("{cohort} (N={n})"), sm = "HR",
+    data = mod_df
+  ))
+  meta::forest(m,
+    xlim = c(0.5, 2), pooled.totals = TRUE, label.e = "events",
+    leftcols = c("studlab", "n_inflamed", "n_desert", "n_events"),
+    leftlabs = c("Study", "N inflamed", "N desert", "N events")
+  )
+}
+```
+
+
+```{r fig.width=12, fig.height=7}
+d <- TCGA_surv_imm_phe %>%
+  filter(CD8IMMPH_pred %in% c("inflamed", "desert"))
+
+{
+  svg(
+    here::here("figures/fig6b_tcga_forest.svg"),
+    width = 12,
+    height = 7
+  )
+  tcga_forest_plot(d, "inflamed")
+  dev.off()
+}
+tcga_forest_plot(d, "inflamed")
+```
+
+# Correlation with mutations
+Here we are using missense & nonsense somatic mutations
+
+```{r fig.width=8, fig.height=5}
+library(RTCGA.mutations)
+mut_data <- ls("package:RTCGA.mutations") %>%
+  map(function(d) {
+    get(d) %>%
+      mutate(id = d) %>%
+      filter(Variant_Classification %in% c("Missense_Mutation", "Nonsense_Mutation")) %>%
+      filter(Mutation_Status == "Somatic") %>%
+      group_by(id, bcr_patient_barcode) %>%
+      summarize(n = n(), .groups = "drop")
+  }) %>%
+  bind_rows() %>%
+  filter(str_starts(bcr_patient_barcode, "TCGA-")) %>%
+  mutate(bcr_patient_barcode = str_replace(bcr_patient_barcode, "-[^-]{2}$", "")) %>%
+  group_by(bcr_patient_barcode) %>%
+  summarize(n = median(n))
+
+
+
+mut_merged <- tcga_subset_pred %>%
+  inner_join(mut_data, by = c("tcga.xml_bcr_patient_barcode" = "bcr_patient_barcode"))
+
+mut_merged %>%
+  group_by(cohort) %>%
+  mutate(n_median = median(n)) %>%
+  ungroup() %>%
+  arrange(-n_median) %>%
+  mutate(cohort = fct_inorder(cohort)) %>%
+  ggplot() +
+  aes(cohort, n, fill = CD8IMMPH_pred) +
+  geom_boxplot() +
+  scale_y_log10() +
+  ylab("Number of nonsense and missense mutations") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  scale_fill_manual(values = pheno_col)
+```
+
+# Association with LAMP5 and NKD1 expression levels
+```{r "classify as low/high"}
+gene_ids <- fData(tcga_subset) %>%
+  filter(gene_name %in% c("LAMP5", "NKD1")) %>%
+  {
+    set_names(rownames(.), .$symbol)
+  }
+
+gene_median_expr <- map(
+  gene_ids,
+  ~ median(exprs(tcga_subset)[.x, ])
+)
+
+high_low <- function(symbol) {
+  if_else(
+    exprs(tcga_subset)[gene_ids[symbol], ] > gene_median_expr[symbol],
+    str_c(symbol, "_HIGH"),
+    str_c(symbol, "_LOW")
+  ) %>%
+    factor() %>%
+    fct_rev()
+}
+
+pData(tcga_subset)$NKD1 <- high_low("NKD1")
+pData(tcga_subset)$LAMP5 <- high_low("LAMP5")
+```
+
+```{r fig.height=8}
+tcga_expression_summary <- pData(tcga_subset) %>%
+  select(study, LAMP5, NKD1) %>%
+  pivot_longer(-study,
+    values_transform = function(x) str_replace(x, ".*_", ""),
+    names_to = "gene",
+    values_to = "status"
+  ) %>%
+  group_by(study, gene) %>%
+  mutate(prop_high = sum(status == "HIGH") / n(), count = n()) %>%
+  ungroup() %>%
+  mutate(study = fct_reorder(study, -prop_high))
+
+tcga_expression_summary %>%
+  ggplot() +
+  aes(study, fill = status) +
+  geom_bar(position = "fill") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  geom_text(aes(label = count, x = study, fill = NULL),
+    data = distinct(tcga_expression_summary, study, count),
+    y = 1.01, angle = 90, hjust = 0
+  ) +
+  ylim(0, 1.09) +
+  facet_wrap(~gene, ncol = 1) +
+  ylab("proportion")
+
+ggsave(here::here("figures/sup_fig7b_tcga_lapm5_nkd1_status.svg"))
+```
+
+```{r}
+pData(tcga_subset) %>%
+  select(study, LAMP5, NKD1) %>%
+  mutate(status = str_glue("{LAMP5} {NKD1}")) %>%
+  group_by(study) %>%
+  mutate(phigh = sum(status == "LAMP5_HIGH NKD1_HIGH") / n()) %>%
+  ungroup() %>%
+  arrange(-phigh) %>%
+  mutate(study = factor(study) %>% fct_inorder()) %>%
+  ggplot() +
+  aes(study, fill = status) +
+  geom_bar(position = "fill") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  geom_text(aes(label = count, x = study, fill = NULL),
+    data = distinct(tcga_expression_summary, study, count),
+    y = 1.01, angle = 90, hjust = 0
+  ) +
+  ylim(0, 1.09) +
+  ylab("proportion")
+```
+
+```{r message=FALSE, warning=FALSE}
+tcga_subset_expr <- pData(tcga_subset) %>%
+  select(tcga.xml_bcr_patient_barcode, LAMP5, NKD1, cohort = study) %>%
+  mutate(across(c(LAMP5, NKD1), ~ str_replace(.x, ".*_", ""))) %>%
+  mutate(across(c(LAMP5, NKD1), factor, levels = c("LOW", "HIGH")))
+
+TCGA_surv_expr <- TCGA_surv %>%
+  inner_join(tcga_subset_expr, by = c("bcr_patient_barcode" = "tcga.xml_bcr_patient_barcode")) %>%
+  rename(time = times, event = patient.vital_status)
+
+table(tcga_subset_expr$cohort, useNA = "always")
+
+
+survplots <- unique(TCGA_surv_expr$cohort) %>%
+  set_names() %>%
+  map(
+    ~ RTCGA::kmTCGA(
+      filter(TCGA_surv_expr, cohort == .x),
+      times = "time",
+      status = "event",
+      explanatory.names = c("LAMP5", "NKD1", "cohort"),
+      pval = TRUE,
+      conf.int = FALSE,
+      xlim = c(0, 4000)
+    )
+  )
+```
+
+## KM plots {.tabset .tabset-pills}
+```{r fig.width=10, fig.height=8, results="asis"}
+survplots %>%
+  iwalk(function(p, n) {
+    cat(str_c("### ", n, "\n\n"))
+    print(p)
+    cat("\n\n")
+  })
+```
+
+```{r}
+fit_tcga_expr <- function(d, gene) {
+  large_cohorts <- d %>%
+    distinct(bcr_patient_barcode, cohort, LAMP5, NKD1) %>%
+    group_by(cohort) %>%
+    filter(
+      sum(.data[[gene]] == "HIGH") > 10,
+      sum(.data[[gene]] == "LOW") > 10
+    ) %>%
+    distinct(cohort)
+
+  large_cohorts <- d %>%
+    group_by(cohort) %>%
+    filter(event == 1) %>%
+    tally() %>%
+    filter(n > 15) %>%
+    inner_join(large_cohorts, by = "cohort")
+
+  unique(large_cohorts$cohort) %>%
+    set_names() %>%
+    map(
+      function(co) {
+        survival::coxph(
+          as.formula(str_glue("survival::Surv(time, event) ~ {gene}")),
+          subset = cohort == co,
+          data = d
+        )
+      }
+    )
+}
+
+fits_expr_to_df <- function(l, d, gene) {
+  imap_dfr(l,
+    function(f, co) {
+      n_high <- sum(d[d$cohort == co, gene] == "HIGH")
+      s <- summary(f)
+      tibble(
+        coef = str_replace(rownames(s$conf.int), "HIGH$", " HIGH"),
+        HR = s$conf.int[, "exp(coef)"],
+        HR_lower = s$conf.int[, "lower .95"],
+        HR_upper = s$conf.int[, "upper .95"],
+        n = s$n,
+        n_high = n_high,
+        n_events = s$nevent
+      )
+    },
+    .id = "cohort"
+  )
+}
+
+tcga_forest_expr_plot <- function(d, gene) {
+  mod_df <- fit_tcga_expr(d, gene) %>%
+    fits_expr_to_df(d, gene)
+  m <- with(mod_df, meta::metagen(log(HR),
+    lower = log(HR_lower), upper = log(HR_upper),
+    studlab = str_glue("{cohort}"), sm = "HR",
+    data = mod_df
+  ))
+  meta::forest(m,
+    xlim = c(0.5, 2), pooled.totals = TRUE, label.e = "events",
+    leftcols = c("studlab", "n", "n_high", "n_events"),
+    leftlabs = c("Study", "N", "N high", "N events")
+  )
+  grid::grid.text(str_glue("{gene} high"), .5, .9, gp = grid::gpar(cex = 1.5))
+}
+```
+
+## Forest plot
+
+```{r fig.width=10, fig.height=7.5}
+{
+  fn <- "figures/sup_fig7_tcga_lamp5_nkd1_forest_%02d.svg"
+  svglite::svglite(
+    here::here(fn),
+    width = 12,
+    height = 7
+  )
+  tcga_forest_expr_plot(TCGA_surv_expr, "LAMP5")
+  tcga_forest_expr_plot(TCGA_surv_expr, "NKD1")
+  dev.off()
+
+  # replace [1.23; 4.56] to [1.23-4.56]
+  cmd <- r"(sed -i 's/\(\[[0-9]*\(\.[0-9]*\)\?\); \([0-9]*\(\.[0-9]*\)\?\)\]/\1–\3]/g')"
+  system(paste(cmd, here::here(sprintf(fn, 1))))
+  system(paste(cmd, here::here(sprintf(fn, 2))))
+}
+tcga_forest_expr_plot(TCGA_surv_expr, "LAMP5")
+tcga_forest_expr_plot(TCGA_surv_expr, "NKD1")
+```
+
+<details>
+<summary>Session info</summary>
+```{r}
+devtools::session_info()
+```
+</details>

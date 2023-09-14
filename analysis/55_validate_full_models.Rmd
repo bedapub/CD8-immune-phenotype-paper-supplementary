@@ -1,0 +1,124 @@
+---
+title: "Assess performance of models on validation dataset"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+source("../src/utils.R")
+```
+
+```{r}
+theme_set(theme_bw())
+```
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_validation <- aws.s3::s3readRDS("eset_validation.Rds", params$output_collection)
+sig_scores <- aws.s3::s3readRDS("sig_scores.Rds", params$output_collection)
+immune_genes <- aws.s3::s3read_using(
+  readLines,
+  object = "ImmuneGenes.tsv",
+  bucket = params$data_collection
+)
+```
+
+Load models
+```{r "save models"}
+models <- aws.s3::s3readRDS(
+  object = "train_models.Rds",
+  bucket = params$output_collection
+)
+```
+
+Create tibbles for validation
+```{r "create validation df"}
+datasets <- list(
+  all_rnaseq = create_modeling_df(eset_validation),
+  immune_rnaseq = create_modeling_df(eset_validation, include_only_genes = immune_genes),
+  non_immune_rnaseq = create_modeling_df(eset_validation, exclude_genes = immune_genes),
+  sc_scores = create_modeling_df(eset_validation,
+    use_genes = FALSE, signatures = sig_scores, signature_namespace = "sc"
+  ),
+  hallmark_scores = create_modeling_df(eset_validation,
+    use_genes = FALSE, signatures = sig_scores, signature_namespace = "hallmark"
+  ),
+  cancer_scores = create_modeling_df(eset_validation,
+    use_genes = FALSE, signatures = sig_scores, signature_namespace = "cancer"
+  )
+)
+```
+
+```{r}
+pred <- names(models) %>%
+  set_names() %>%
+  map(~ models[[.x]]$predict_newdata(datasets[[.x]]))
+```
+
+```{r}
+pred_df <- pred %>%
+  map(as.data.table) %>%
+  bind_rows(.id = "task_id") %>%
+  set_task_name() %>%
+  filter(task_id != "non_immune_rnaseq")
+
+pred_df %>%
+  group_by(task_name) %>%
+  mutate(truth = factor(truth)) %>%
+  yardstick::roc_curve(truth, starts_with("prob.")) %>%
+  autoplot() +
+  facet_wrap(~.level, ncol = 2)
+```
+
+
+```{r}
+auc_df <- pred_df %>%
+  pivot_longer(starts_with("prob."), names_prefix = "prob.", names_to = ".level", values_to = "prob") %>%
+  mutate(positive = as.factor(truth == .level)) %>%
+  group_by(task_name, .level) %>%
+  yardstick::roc_auc(positive, prob, event_level = "second") %>%
+  rename(AUC = .estimate, class = .level, model = task_name)
+
+auc_df %>%
+  ggplot() +
+  aes(model, AUC, fill = model) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~class, ncol = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  coord_flip() +
+  scale_x_discrete(limits = rev)
+```
+
+Show AUCs as a table
+```{r}
+auc_df %>%
+  select(-.metric, -.estimator) %>%
+  pivot_wider(names_from = "class", values_from = "AUC") %>%
+  mutate(across(where(is.numeric), round, 3)) %>%
+  arrange(model) %>%
+  gt::gt()
+```
+

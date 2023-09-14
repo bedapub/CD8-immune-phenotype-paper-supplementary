@@ -1,0 +1,89 @@
+---
+title: "Train model on train and validation data"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  output_sharing_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+```
+
+
+```{r "random seed"}
+# supposedly future should handle parallelization & random number generation properly
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_train <- aws.s3::s3readRDS("eset_train.Rds", params$output_collection)
+eset_validation <- aws.s3::s3readRDS("eset_validation.Rds", params$output_collection)
+```
+
+Combine ExpressionSet objects
+```{r "combine eset"}
+eset_trval <- BiocGenerics::combine(
+  eset_train,
+  eset_validation
+)
+
+stopifnot(nrow(eset_train) == nrow(eset_validation))
+stopifnot(nrow(eset_train) == nrow(eset_trval))
+stopifnot(ncol(eset_train) + ncol(eset_validation) == ncol(eset_trval))
+```
+
+
+Create tibbles for training.
+```{r "create training df"}
+dataset <- create_modeling_df(eset_trval)
+```
+
+
+Tasks
+```{r tasks}
+task <- TaskClassif$new(id = "rnaseq", backend = dataset, target = "IHC_Status")
+task$set_col_roles("IHC_Status", roles = c("target", "stratum"))
+task
+```
+
+Learner
+```{r learner}
+learner <- lrn("classif.cv_glmnet", alpha = 1, predict_type = "prob")
+```
+
+```{r "train model", include = FALSE, warning = FALSE, message = FALSE}
+model <- learner$train(task)
+```
+
+```{r "save models"}
+aws.s3::s3saveRDS(
+  model,
+  object = "full_model.Rds",
+  bucket = params$output_collection
+)
+
+aws.s3::s3saveRDS(
+  model,
+  object = "full_model.Rds",
+  bucket = params$output_sharing_collection
+)
+```

@@ -1,0 +1,92 @@
+---
+title: "Preprocess TCGA"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(recount3)
+library(Biobase)
+library(assertthat)
+library(tidyverse)
+```
+
+```{r random seed}
+set.seed(42)
+```
+
+Load TCGA projects
+```{r "load TCGA", message=FALSE}
+tcga_projects <- available_projects() %>%
+  filter(file_source == "tcga")
+
+tcga_projects <- tcga_projects %>%
+  rowwise() %>%
+  mutate(rse_gene = list(create_rse(cur_data()))) %>%
+  ungroup()
+
+tcga_projects <- tcga_projects %>%
+  mutate(rse_gene = map(
+    rse_gene,
+    function(.x) {
+      assay(.x, "counts") <- transform_counts(.x)
+      assay(.x, "vst") <- DESeq2::vst(assay(.x, "counts"))
+      .x
+    }
+  ))
+```
+
+Filter out lowly expressed genes
+```{r "remove lowly expressed"}
+q_expression <- tcga_projects %>%
+  filter(project == "LUAD") %>%
+  pull(rse_gene) %>%
+  .[[1]] %>%
+  assay("vst") %>%
+  apply(1, quantile, 0.9)
+
+
+qplot(q_expression, geom = "histogram", bins = 50) +
+  geom_vline(xintercept = 7, col = "red")
+
+cond <- q_expression > 7
+n_rm <- sum(!(cond))
+n_tot <- length(cond)
+message(str_glue("Filtering out {n_rm} out of {n_tot} ({round(100*n_rm/n_tot, 2)}%)"))
+
+tcga_projects <- tcga_projects %>%
+  mutate(rse_gene = map(rse_gene, ~ .x[cond, ]))
+```
+
+Bind rse objects
+```{r "combine RSEs"}
+combined_rse_gene <- do.call(cbind, tcga_projects$rse_gene)
+
+# remove unused assays
+assay(combined_rse_gene, "counts") <- NULL
+assay(combined_rse_gene, "raw_counts") <- NULL
+
+eset <- ExpressionSet(assay(combined_rse_gene, "vst"),
+  phenoData = new("AnnotatedDataFrame", as.data.frame(colData(combined_rse_gene))),
+  featureData = new("AnnotatedDataFrame", as.data.frame(rowData(combined_rse_gene)))
+)
+```
+
+```{r "save TCGA"}
+aws.s3::s3saveRDS(eset,
+  object = "tcga_eset.Rds",
+  bucket = params$output_collection
+)
+```

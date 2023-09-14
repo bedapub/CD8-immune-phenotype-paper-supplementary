@@ -1,0 +1,163 @@
+---
+title: "Split data into train/test/validation"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(Biobase)
+library(assertthat)
+library(tidyverse)
+```
+
+```{r random seed}
+set.seed(42)
+```
+
+Read ExpressionSet object.
+```{r}
+eset <- aws.s3::s3readRDS(
+  "eset_batch_corrected.Rds",
+  bucket = params$output_collection
+)
+
+eset <- eset[, !is.na(eset$CD8IMMPH)]
+```
+
+Split train/test/validation.
+```{r train test validation}
+set.seed(42, "L'Ecuyer")
+test_subj <- eset %>%
+  pData() %>%
+  group_by(CD8IMMPH) %>%
+  slice_sample(prop = 0.05) %>%
+  pull(A_USUBJID)
+
+val_subj <- eset %>%
+  pData() %>%
+  filter(!(A_USUBJID %in% test_subj) & STUDYID != "GO28915") %>%
+  group_by(CD8IMMPH) %>%
+  slice_sample(prop = 0.1) %>%
+  pull(A_USUBJID)
+
+
+pData(eset)$train_test_val <- eset %>%
+  pData() %>%
+  with(case_when(
+    A_USUBJID %in% val_subj ~ "validation",
+    A_USUBJID %in% test_subj | STUDYID == "GO28915" ~ "test",
+    TRUE ~ "train"
+  ))
+```
+
+
+Create split `ExpressionSet`s.
+```{r}
+eset_train <- eset[, eset$train_test_val == "train"]
+eset_validation <- eset[, eset$train_test_val == "validation"]
+eset_test <- eset[, eset$train_test_val == "test"]
+```
+
+
+Gene expression distribution
+```{r "expression distribution"}
+med_expr <- eset_train %>%
+  exprs() %>%
+  apply(1, median)
+
+qplot(med_expr, geom = "histogram")
+```
+
+Number of genes used for the model: `r nrow(eset_train)`.
+
+```{r "check that adding new samples didn't affect the train/test/validation split", eval=FALSE}
+ttv_ <- aws.s3::s3read_using(
+  read_tsv,
+  object = "train_test_val.tsv",
+  bucket = params$data_collection
+)
+
+
+ttv <- pData(eset) %>%
+  rownames_to_column("A_SampleID") %>%
+  select(A_SampleID, A_USUBJID, STUDYID, train_test_val)
+
+
+ttv_fj <- full_join(ttv, ttv_, by = "A_SampleID")
+
+stopifnot(sum(is.na(ttv_fj$train_test_val.x)) == 0)
+stopifnot(sum(is.na(ttv_fj$train_test_val.y)) == 0)
+
+stopifnot(all(ttv_fj$train_test_val.x == ttv_fj$train_test_val.y))
+
+rm(ttv_, ttv, ttv_fj)
+```
+
+
+Save train/test/validation split.
+```{r save train/test split & Rds object}
+pData(eset) %>%
+  rownames_to_column("A_SampleID") %>%
+  select(A_SampleID, A_USUBJID, STUDYID, train_test_val) %>%
+  aws.s3::s3write_using(
+    write_tsv,
+    object = "train_test_val.tsv",
+    bucket = params$data_collection
+  )
+
+list(
+  eset_train = eset_train,
+  eset_validation = eset_validation,
+  eset_test = eset_test
+) %>%
+  imap(~ aws.s3::s3saveRDS(.x, str_c(.y, ".Rds"), params$output_collection))
+```
+
+
+# Overview of train/test/split proportions
+```{r}
+eset %>%
+  pData() %>%
+  group_by(STUDYID) %>%
+  mutate(n_patients = n()) %>%
+  group_by(STUDYID, n_patients, CD8IMMPH) %>%
+  summarize(
+    n_patients_class = n(),
+    n_test = sum(train_test_val == "test"),
+    n_val = sum(train_test_val == "validation"),
+    prop_test = sum(train_test_val == "test") / n(),
+    prop_val = sum(train_test_val == "validation") / n(),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.double), round, 3)) %>%
+  DT::datatable(rownames = FALSE)
+```
+
+## Train/test/validation numbers
+```{r}
+eset %>%
+  pData() %>%
+  count(train_test_val) %>%
+  gt::gt()
+```
+
+### Without oak
+```{r}
+eset %>%
+  pData() %>%
+  filter(STUDYID != "GO28915") %>%
+  count(train_test_val) %>%
+  gt::gt()
+```

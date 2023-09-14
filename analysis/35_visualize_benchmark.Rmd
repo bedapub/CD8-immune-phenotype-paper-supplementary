@@ -1,0 +1,189 @@
+---
+title: "Visualize model benchmarking results"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(glmnet)
+requireNamespace("ComplexHeatmap")
+requireNamespace("circlize")
+```
+
+```{r funcs}
+source("../src/utils.R")
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+source("../src/mlr_plots.R")
+```
+
+
+```{r ggtheme}
+theme_set(theme_bw())
+```
+
+```{r "random seed"}
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_train <- aws.s3::s3readRDS("eset_train.Rds", params$output_collection)
+eset_validation <- aws.s3::s3readRDS("eset_validation.Rds", params$output_collection)
+sig_scores <- aws.s3::s3readRDS("sig_scores.Rds", params$output_collection)
+bm_res <- aws.s3::s3readRDS("model_becnhmark.Rds", params$output_collection)
+```
+
+Feature matrix.
+```{r}
+feature_m <- create_modeling_df(eset_train, signatures=sig_scores)
+```
+
+
+Scores
+```{r "auc scores"}
+multi_aucs <- eset_train$CD8IMMPH %>%
+  str_to_lower() %>%
+  unique() %>%
+  map(~ multiclass_auc(.)$new())
+```
+
+```{r res_tab}
+res_order <- c(
+  "all_rnaseq",
+  "immune_rnaseq",
+  "non_immune_rnaseq",
+  "sc_scores",
+  "hallmark_scores",
+  "cancer_scores"
+)
+res_tab <- bm_res$score(multi_aucs) %>%
+  set_task_name() %>%
+  mutate(task_order = match(task_id, res_order)) %>%
+  arrange(task_order) %>%
+  mutate(task_name = factor(task_name, levels = unique(task_name)))
+res_tab$coef <- map(res_tab$learner, extr_glm_coef)
+```
+
+Plot AUCs
+```{r "auc plot"}
+p <- res_tab %>%
+  filter(task_id != "non_immune_rnaseq") %>%
+  select(task_id, task_name, starts_with("auc")) %>%
+  pivot_longer(starts_with("auc"), names_to = "class", names_prefix = "auc.", values_to = "AUC") %>%
+  group_by(task_name, class) %>%
+  summarize(mean_AUC = mean(AUC), .groups = "drop") %>%
+  ggplot(aes(mean_AUC, task_name, color = class)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = pheno_col) +
+  scale_y_discrete(limits=rev) +
+  labs(y = "Classifier features", x = "Average AUC")
+p
+
+ggsave(here::here("figures/fig4a_auc_benchmark_models.svg"))
+```
+
+```{r "auc plot for poster"}
+ylabs_fix <- function(v) {
+  v <- as.character(v)
+  case_when(
+    v == "Only immune-specific genes (RNA-Seq)" ~ "Only immune-specific genes\n(RNA-Seq)",
+    v == "Cancer-specific signature scores" ~ "Cancer-specific\nsignature scores",
+    TRUE ~ v
+  )
+}
+p$data$task_name <- fct_relabel(p$data$task_name, ylabs_fix)
+
+p <- p +
+  theme(
+    text = element_text(size = 9),
+    legend.key.height = unit(3, "mm"),
+    #panel.background = element_rect(fill = "transparent"),
+    strip.background = element_rect(fill = "transparent"),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent"),
+    legend.key = element_rect(fill = "transparent")
+    #panel.grid.major = element_blank(),
+    #panel.grid.minor = element_blank()
+  )
+ggsave(
+  here::here("figures/fig4a_auc_benchmark_models_poster.png"),
+  p,
+  width = 10, height = 5, units = "cm", dpi = 300, scale = 1,
+  bg = "transparent"
+)
+```
+
+```{r}
+res_tab %>%
+  filter(task_id != "non_immune_rnaseq") %>%
+  select(iteration, task_name, coef) %>%
+  unnest(coef) %>%
+  filter(feature != "(Intercept)") %>%
+  mutate(class = factor(class, levels = names(pheno_col))) %>%
+  group_by(iteration, task_name, class) %>%
+  summarize(n_features = n(), .groups = "drop") %>%
+  arrange(task_name, class, n_features) %>%
+  mutate(row = row_number()) %>%
+  ggplot(aes(class, n_features, fill = class, group = row)) +
+  geom_col(position="dodge") +
+  scale_fill_manual(values = pheno_col) +
+  facet_wrap(~ task_name) +
+  ggtitle("Number of features")
+```
+
+```{r coef_heatmaps, warning=FALSE, fig.width=10, fig.height=10}
+res_tab %>%
+  group_by(task_id, task_name) %>%
+  nest() %>%
+  rowwise() %>%
+  mutate(hm = list(glmnet_coef_heatmap(data, feature_m, 4, pheno_col = pheno_col, task_name))) %>%
+  invisible()
+```
+
+```{r coef_heatmap_export, warning=FALSE}
+svg("../figures/supp_fig_5a_%d.svg", width = 10, height = 10)
+res_tab %>%
+  mutate(task_id = factor(
+    task_id,
+    levels =  c("all_rnaseq", "sc_scores", "hallmark_scores")
+  )) %>%
+  filter(!is.na(task_id)) %>%
+  group_by(task_id, task_name) %>%
+  nest() %>%
+  arrange(task_id) %>%
+  rowwise() %>%
+  mutate(hm = list(glmnet_coef_heatmap(data, feature_m, 4, pheno_col = pheno_col, task_name))) %>%
+  invisible()
+dev.off()
+```
+
+```{r export_sc_features}
+sc_features <- res_tab %>%
+  filter(task_id == "sc_scores") %>%
+  select(iteration, coef) %>%
+  unnest(coef) %>%
+  group_by(class, feature) %>%
+  mutate(n_present = n(), median_coef = median(coef)) %>%
+  ungroup()
+
+aws.s3::s3write_using(sc_features,
+                      write_tsv,
+                      object = "features_sc_cv.tsv",
+                      bucket = params$output_collection
+)
+```
+

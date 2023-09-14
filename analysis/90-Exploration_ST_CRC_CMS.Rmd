@@ -1,0 +1,2977 @@
+---
+title: "CD8 Immune Phenotyping Manuscript: Exploration of CRC Spatial Transcriptomics data"
+author: 'Alberto Valdeolivas Urbelz (PS-PMDA)'
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    self_contained: true
+    number_sections: yes
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: spacelab
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+params:
+  data_directory : "../data/"
+  analysis_name : "CD8_Immune_Phenotyping_manuscript/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this script, we use two publicly available Spatial Transcriptomics (ST) 
+datasets derived from colorectal cancer (CRC) patients to explore some of the 
+results presented in the manuscript entitled:  
+
+*Tumor-agnostic transcriptome-based classifier identifies spatial infiltration patterns of CD8 T cells in the tumor microenvironment and predicts clinical outcome in early- and late-phase clinical trials* 
+
+In particular, the ST data were collected from the following publications: 
+
+- **Charting the Heterogeneity of Colorectal Cancer Consensus Molecular Subtypes using Spatial Transcriptomics** [DOI: https://doi.org/10.1101/2023.01.23.525135](https://www.biorxiv.org/content/10.1101/2023.01.23.525135v2)
+
+- **Spatiotemporal Immune Landscape of Colorectal Cancer Liver Metastasis at Single-Cell Level** [DOI: 10.1158/2159-8290.CD-21-0316](https://cancerdiscovery.aacrjournals.org/content/12/1/134.long)
+
+Both datasets were generated with 10x VISIUM Spatial Gene Expression. This 
+technology currently lacks single cell resolution. Consequently, ST was 
+integrated with a publicly available CRC scRNA-seq dataset via a deconvolution 
+approach in order to map the different cell type abundances to their spatial 
+location. This protocol is detailed in the first publication listed above. 
+
+Of note, 4 different types of CRC tumor epithelial cells were present in the 
+scRNA-seq dataset used as reference: CMS1, CMS2, CMS3 and CMS4. The most 
+abundant subtypes in the analysed ST datasets were CMS1 and CMS2. Interestingly,
+CMS1 tumors are defined as immune-hot whereas CMS2 as immune-cold. Consequently,
+they can be assimilated as CD8-inflamed tumors and CD8-desert respectively. 
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(Seurat)
+library(tidyr)
+library(stringr)
+library(readr)
+library(cowplot)
+
+data_directory <-  params$data_directory
+analysis_name <- params$analysis_name
+```
+
+
+# Results
+
+We present in separated subsections the results obtained from the data obtained 
+from the two different publications. 
+
+## ST dataset from: Charting the Heterogeneity of Colorectal Cancer Consensus Molecular Subtypes using Spatial Transcriptomics
+
+This dataset contains 14 ST CRC samples obtained from 7 different CRC patients. 
+Two serial sections per patient were considered in order to generate technical 
+replicates. In this dataset, each spot was assigned to a tissue category by a 
+pathologist based on the histopahtology of the samples. This information 
+complements and supports the results of the deconvolution. The information
+required to run this section can be downloaded from [zenodo](https://doi.org/10.5281/zenodo.7551712).
+
+We now present the results for some of these samples. 
+
+```{r, warning=FALSE, message=FALSE}
+# Reading the required files. 
+
+## Reading the Seurat objects. They can be downloaded from Zenodo at
+## https://doi.org/10.5281/zenodo.7553463
+input_seuratobj_ST_CRC <- "IntermediaryFiles/SeuratList_Clusters_Res05.rds"
+ST_CRC_SeuratObjects <- readRDS(paste0(data_directory, input_seuratobj_ST_CRC))
+
+## Reading and formatting the pathologists' annotations. Adding the information
+## as metadata to the Seurat object. These annotations can be found at Zenodo:
+## https://doi.org/10.5281/zenodo.7553463
+input_pathoAnnotations <- 
+  paste0(data_directory, "IntermediaryFiles/Patho_Annotations/")
+
+ST_CRC_SeuratObjects <- 
+  lapply(ST_CRC_SeuratObjects, function(x){
+    current_sample <- unique(x@meta.data$orig.ident)
+    
+    patho_anno_current_sample <- 
+      read_csv(file = paste0(input_pathoAnnotations, "Pathologist_Annotations_", 
+        current_sample, ".csv"))
+    
+    colnames(patho_anno_current_sample) <- c("Barcode", "Pathologist_Annotations")
+    
+    x@meta.data <- x@meta.data %>%
+      tibble::rownames_to_column("spot_id") %>%
+      dplyr::left_join(patho_anno_current_sample, by = c("spot_id" = "Barcode")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "tumor&stroma IC med to high", "tumor&stroma_IC med to high")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "epitehlium&submucosa", "epithelium&submucosa")) %>% 
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggregate submucosa", "IC aggregate_submucosa")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggregregate_submucosa", "IC aggregate_submucosa")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggreates_stroma or muscularis", "IC aggregate_stroma or muscularis")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggragate_stroma or muscularis", "IC aggregate_stroma or muscularis")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggreates_stroma or muscularis", "IC aggregate_stroma or muscularis")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggregate_muscularis or stroma", "IC aggregate_stroma or muscularis")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "stroma desmoplastic_IC low", "stroma_desmoplastic_IC low")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "stroma desmoplastic_IC med to high", "stroma_desmoplastic_IC med to high")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "stroma_fibroblastic_IC high", "stroma_fibroblastic_IC_high")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "stroma_fibroblastic_IC med", "stroma_fibroblastic_IC_med")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "stroma_fibroblastic_IC_med", "stroma_fibroblastic_IC med to high")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "stroma_fibroblastic_IC_high", "stroma_fibroblastic_IC med to high")) %>%
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "submucosa", "lamina propria")) %>% 
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "epithelium&submucosa", "epithelium&lam propria")) %>% 
+      dplyr::mutate(Pathologist_Annotations = str_replace(Pathologist_Annotations, 
+       "IC aggregate_submucosa", "IC aggregate_lam propria")) %>% 
+      tibble::column_to_rownames("spot_id") 
+      
+    Idents(x) <- 'Pathologist_Annotations'
+    
+    return(x)
+})
+
+## Reading and formatting the results of the deconvolution. Adding the information
+## as metadata to the Seurat object. These results can be found at Zenodo:
+## https://doi.org/10.5281/zenodo.7553463
+
+input_results_C2L_decon <- 
+  "Cell2Location/results/LocationModelLinearDependentWMultiExperiment_14experiments_36clusters_20654locations_4188genes/W_cell_density_q05.csv"
+
+results_C2L_decon <- read_csv(paste0(data_directory, input_results_C2L_decon)) %>%
+  dplyr::mutate(spot_id = str_remove(.$spot_id, pattern = "Count_")) %>%
+  dplyr::mutate(spot_id = str_replace(.$spot_id, pattern = "SN123_A938797_Rep1_" ,
+                                      replacement = "SN123_A938797_Rep1_X_")) 
+
+colnames(results_C2L_decon) <-str_replace(colnames(results_C2L_decon), 
+  pattern = "q05_spot_factors", replacement = "")
+
+results_C2L_decon <- results_C2L_decon %>% 
+  dplyr::mutate(sample = str_extract(.$spot_id, pattern =".*Rep[1-2]")) %>%
+  dplyr::mutate(spot_id = str_remove(.$spot_id, pattern =".*Rep[1-2]_"))
+
+
+ST_CRC_SeuratObjects <- 
+  lapply(ST_CRC_SeuratObjects, function(x){
+    current_sample <- unique(x@meta.data$orig.ident)
+    
+    results_C2L_decon_currentSample <- results_C2L_decon %>% 
+      dplyr::filter(sample == current_sample)
+      
+    
+    x@meta.data <- x@meta.data %>% 
+      tibble::rownames_to_column("spot_id") %>%
+      dplyr::left_join(results_C2L_decon_currentSample, by = "spot_id") %>%
+      tibble::column_to_rownames("spot_id")
+    
+    
+    return(x)
+})
+```
+
+### Sample S1_Cec_Rep2
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "SN123_A551763_Rep1"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS1")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S1_Cec_Rep2_CMS1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS1 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S1_Cec_Rep2_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S1_Cec_Rep2_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S1_Cec_Rep2_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+# Spots annotations plots as done by a pathologist. 
+tumor_annotations <- c("tumor", "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(tumor = ifelse(Pathologist_Annotations %in% tumor_annotations,1,0))
+
+S1_Cec_Rep2_tumorSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "tumor", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Tumor-annotated Spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+Stromal_annotations <- c("stroma_fibroblastic_IC med to high", 
+                         "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% Stromal_annotations,1,0))
+
+S1_Cec_Rep2_StromalSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Stromal-annotated spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+S1_Cec_Rep2_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S1_Cec_Rep2_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S1_Cec_Rep2_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+It is important to note that the tissue quality of this particular sample is not 
+very good. It does not present clear morphological patterns and the quality of 
+the gene expression data is lower compared to the remaining samples presented
+in this script. Almost the whole sample is composed of tumor and stromal regions
+as revealed by the Pathologists annotations. The deconvolution indicated that 
+the sample presents a CMS1-CMS2 mixed phenotype, which can be indicative of a 
+transitioning tumor type. Accordingly, the immune infiltration patterns are not 
+so clear. There are some CD8 T cells infiltrated within the tumor but with lower
+numbers than other CMS1 samples. 
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + S1_Cec_Rep2_tumorSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S1_Cec_Rep2_CMS1 + S1_Cec_Rep2_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S1_Cec_Rep2_CD8 + S1_Cec_Rep2_CXCL9
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S1_Cec_Rep2_Myofibroblasts + S1_Cec_Rep2_StromalSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S1_Cec_Rep2_NKD1 + S1_Cec_Rep2_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+S1_Cec_Rep2_CXCL9
+```
+
+
+
+### Sample S2_Col_R_Rep1
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "SN123_A595688_Rep1"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S2_Col_R_Rep1_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S2_Col_R_Rep1_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S2_Col_R_Rep1_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+# Spots annotations plots as done by a pathologist. 
+tumor_annotations <- c("tumor", "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(tumor = ifelse(Pathologist_Annotations %in% tumor_annotations,1,0))
+
+S2_Col_R_Rep1_tumorSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "tumor", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Tumor-annotated Spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+
+IC_annotations <- c("IC aggregate_lamina propria", "IC aggregate_stroma or muscularis")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% IC_annotations,1,0))
+
+S2_Col_R_Rep1_ICSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Immune cell aggregates") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+Stromal_annotations <- c("stroma_fibroblastic_IC med to high", 
+                         "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% Stromal_annotations,1,0))
+
+S2_Col_R_Rep1_StromalSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Stromal-annotated spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+S2_Col_R_Rep1_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S2_Col_R_Rep1_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S2_Col_R_Rep1_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+The deconvolution reveals that the spots annotated as tumor by the pathologists
+correspond to the CMS2 epithelial tumor cell type. Accordingly, it lacks 
+intra-tumoral immune infiltration. However, we can see an aggregate of immune 
+cells located in the lamina propria and the muscularis/stromal region not far 
+from the tumor. In accordance with the results described in the manuscript, 
+the expression of NKD1 is quite high in particular in the stromal and tumor 
+regions. LAMP5 and CXCL9 display scarce and sparse gene expression values.
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() 
+S2_Col_R_Rep1_CMS2_histology <- 
+  Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0))  + theme(legend.text = element_blank(), legend.title = element_blank(), legend.key = element_rect(fill = "white"))
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S2_Col_R_Rep1_CMS2 + S2_Col_R_Rep1_tumorSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S2_Col_R_Rep1_CD8 + S2_Col_R_Rep1_ICSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S2_Col_R_Rep1_Myofibroblasts + S2_Col_R_Rep1_StromalSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S2_Col_R_Rep1_NKD1 + S2_Col_R_Rep1_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+S2_Col_R_Rep1_CXCL9
+```
+
+
+### Sample S3_Col_R_Rep1
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "SN048_A416371_Rep1"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS1")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S3_Col_R_Rep1_CMS1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS1 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S3_Col_R_Rep1_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S3_Col_R_Rep1_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S3_Col_R_Rep1_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+# Spots annotations plots as done by a pathologist. 
+tumor_annotations <- c("tumor", "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(tumor = ifelse(Pathologist_Annotations %in% tumor_annotations,1,0))
+
+S3_Col_R_Rep1_tumorSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "tumor", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Tumor-annotated Spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+
+IC_annotations <- c("IC aggregate_lamina propria", "IC aggregate_stroma or muscularis")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% IC_annotations,1,0))
+
+S3_Col_R_Rep1_ICSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Immune cell aggregates") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+Stromal_annotations <- c("stroma_fibroblastic_IC med to high", 
+                         "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% Stromal_annotations,1,0))
+
+S3_Col_R_Rep1_StromalSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Stromal-annotated spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+S3_Col_R_Rep1_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S3_Col_R_Rep1_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S3_Col_R_Rep1_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+This sample contains a tumor displaying different morphological features. In the 
+upper and upper left region, the tumor shows a tubular growth pattern, while in
+the central and bottom part displays a diffuse growth pattern. Interestingly, 
+CMS2 is predominant in the first described region and CMS1 in the second one. In 
+accordance with the literature, CD8+ T cells are abundant in the CMS1 dominant 
+region and devoid in the CMS2 one. In this sample, gene expresison of NKD1 and
+LAMP5 is sparse and scarce. On the other hand, the gene expression of CXCL9 
+is higher and spread across the sample. 
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + S3_Col_R_Rep1_tumorSpots
+S3_Col_R_Rep1_CMS1_histology <- 
+  Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0))  + theme(legend.text = element_blank(), legend.title = element_blank(), legend.key = element_rect(fill = "white"))
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S3_Col_R_Rep1_CMS1 + S3_Col_R_Rep1_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S3_Col_R_Rep1_CD8 + S3_Col_R_Rep1_CXCL9
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S3_Col_R_Rep1_Myofibroblasts + S3_Col_R_Rep1_StromalSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S3_Col_R_Rep1_NKD1 + S3_Col_R_Rep1_LAMP5
+```
+
+### Sample S4_Col_Sig_Rep2
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "SN84_A120838_Rep2"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S4_Col_Sig_Rep2_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S4_Col_Sig_Rep2_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S4_Col_Sig_Rep2_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+# Spots annotations plots as done by a pathologist. 
+tumor_annotations <- c("tumor", "tumor&stroma_IC med to high", "tumor&stroma_IC low")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(tumor = ifelse(Pathologist_Annotations %in% tumor_annotations,1,0))
+
+S4_Col_Sig_Rep2_tumorSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "tumor", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Tumor-annotated Spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+
+IC_annotations <- c("IC aggregate_stroma or muscularis")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% IC_annotations,1,0))
+
+S4_Col_Sig_Rep2_ICSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Immune cell aggregates") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+Stromal_annotations <- c("stroma_fibroblastic_IC med to high", 
+                         "tumor&stroma_IC med to high", 
+                         "stroma_fibroblastic_IC low",
+                         "tumor&stroma_IC low")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% Stromal_annotations,1,0))
+
+S4_Col_Sig_Rep2_StromalSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Stromal-annotated spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+S4_Col_Sig_Rep2_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+# breaks_vec <- 
+#    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+#              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S4_Col_Sig_Rep2_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S4_Col_Sig_Rep2_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+This sample presents a CMS2 tumor. As in sample S2_Col_R_Rep1, NKD1 expression
+is quite high and spread across the tumor and stromal region. CD8+ T cells 
+are not present in the tumor region, but a few of them are located at the stroma.  
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() 
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S4_Col_Sig_Rep2_CMS2 + S4_Col_Sig_Rep2_tumorSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S4_Col_Sig_Rep2_CD8 + S4_Col_Sig_Rep2_ICSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S4_Col_Sig_Rep2_Myofibroblasts + S4_Col_Sig_Rep2_StromalSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S4_Col_Sig_Rep2_NKD1 + S4_Col_Sig_Rep2_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+S4_Col_Sig_Rep2_CXCL9
+```
+
+
+
+### Sample S5_Rec_Rep1
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "SN048_A121573_Rep1"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S5_Rec_Rep1_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S5_Rec_Rep1_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S5_Rec_Rep1_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+# Spots annotations plots as done by a pathologist. 
+tumor_annotations <- c("tumor", "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(tumor = ifelse(Pathologist_Annotations %in% tumor_annotations,1,0))
+
+S5_Rec_Rep1_tumorSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "tumor", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Tumor-annotated Spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+
+IC_annotations <- c("IC aggregate_lamina propria")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% IC_annotations,1,0))
+
+S5_Rec_Rep1_ICSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Immune cell aggregates") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+Stromal_annotations <- c("stroma_fibroblastic_IC med to high", 
+                         "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% Stromal_annotations,1,0))
+
+S5_Rec_Rep1_StromalSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Stromal-annotated spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+S5_Rec_Rep1_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S5_Rec_Rep1_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S5_Rec_Rep1_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+This sample presents a CMS2 tumor along its border. Stromal regions delimiting 
+the neoplastic mucosa from the non neoplastic mucosa are reduced. CD8 + T cells 
+sit in some immune cell aggregates that are present across the sample. The gene 
+expression map of NKD1 is this sample is not so ubiquitous across the tumor and 
+stroma as in the previous CMS2 tumors (S2_Col_R_Rep1, S4_Col_Sig_Rep2)
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() 
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S5_Rec_Rep1_CMS2 + S5_Rec_Rep1_tumorSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S5_Rec_Rep1_CD8 + S5_Rec_Rep1_ICSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S5_Rec_Rep1_Myofibroblasts + S5_Rec_Rep1_StromalSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S5_Rec_Rep1_NKD1 + S5_Rec_Rep1_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+S5_Rec_Rep1_CXCL9
+```
+
+
+### Sample S6_Rec_Rep2
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "SN124_A938797_Rep2"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S6_Rec_Rep2_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S6_Rec_Rep2_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+S6_Rec_Rep2_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+# Spots annotations plots as done by a pathologist. 
+tumor_annotations <- c("tumor", "tumor&stroma_IC med to high")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(tumor = ifelse(Pathologist_Annotations %in% tumor_annotations,1,0))
+
+S6_Rec_Rep2_tumorSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "tumor", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Tumor-annotated Spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+
+IC_annotations <- c("IC aggregate_lamina propria", 
+                    "IC aggregate_stroma or muscularis")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% IC_annotations,1,0))
+
+S6_Rec_Rep2_ICSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Immune cell aggregates") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+Stromal_annotations <- c("stroma_fibroblastic_IC med to high", 
+                         "tumor&stroma_IC med to high", 
+                         "stroma_desmoplastic_IC med to high",
+                         "stroma_desmoplastic_IC low")
+current_seurat_obj@meta.data <- current_seurat_obj@meta.data %>% 
+  dplyr::mutate(IC = ifelse(Pathologist_Annotations %in% Stromal_annotations,1,0))
+
+S6_Rec_Rep2_StromalSpots <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = "IC", alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Stromal-annotated spots") + 
+      theme(title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + NoLegend()
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+S6_Rec_Rep2_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S6_Rec_Rep2_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+S6_Rec_Rep2_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+This sample presents a particular morphology with small tumor island surrounded 
+by large stromal bundles. The tumor is mapped to CMS2 cell type by the 
+deconvolution, and accordingly the abundance of CD8+ T cells is limited and 
+restricted some immune cell aggregates located in the non neoplastic mucosa or 
+the stromal region. NKD1 gene expression shows similar spatial patterns than
+the ones described for samples S2_Col_R_Rep1 and S4_Col_Sig_Rep2.
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() 
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S6_Rec_Rep2_CMS2 + S6_Rec_Rep2_tumorSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S6_Rec_Rep2_CD8 + S6_Rec_Rep2_ICSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S6_Rec_Rep2_Myofibroblasts + S6_Rec_Rep2_StromalSpots
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+S6_Rec_Rep2_NKD1 + S6_Rec_Rep2_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+S6_Rec_Rep2_CXCL9
+```
+
+
+## ST dataset from: Spatiotemporal Immune Landscape of Colorectal Cancer Liver Metastasis at Single-Cell Level
+
+This ST dataset contains four samples from primary CRC tumors and their 
+corresponding four liver metastases. Two of the patients were untreated and the 
+other two were treated with neoadjuvant chemotherapy. We lack pathologist spot 
+categorization for the samples of this dataset. The four samples seem to display
+a CMS2 phenotype although in some of them the tumor content is very limited. 
+
+```{r, warning=FALSE, message=FALSE}
+# Reading the required files. 
+
+## Reading the Seurat objects. This Information can be downloaded from Zenodo at
+## https://doi.org/10.5281/zenodo.7553463
+input_seuratobj_ST_CRC <- 
+  "ST_LiverMetastases_pub/IntermediaryFiles/SeuratList_Clusters_Res05.rds"
+ST_CRC_SeuratObjects <- 
+  readRDS(paste0(data_directory, input_seuratobj_ST_CRC))
+
+## Reading and formatting the results of the deconvolution. Adding the information
+## as metadata to the Seurat object. These results can be found in Zenodo: 
+## https://doi.org/10.5281/zenodo.7553463
+
+input_results_C2L_decon <- 
+  "Cell2Location/results/LocationModelLinearDependentWMultiExperiment_8experiments_36clusters_31296locations_4188genesLiverMetastasis/W_cell_density_q05.csv"
+
+results_C2L_decon <- 
+  read_csv(paste0(data_directory, input_results_C2L_decon))
+
+colnames(results_C2L_decon) <-
+  str_replace(colnames(results_C2L_decon), 
+              pattern = "q05_spot_factors", replacement = "")
+
+results_C2L_decon <- results_C2L_decon %>% 
+  dplyr::mutate(sample = str_extract(.$spot_id, pattern =".*_")) %>%
+  dplyr::mutate(sample = str_remove(.$sample, pattern = "_")) %>% 
+  dplyr::mutate(spot_id = str_remove(.$spot_id, pattern =".*_")) 
+
+
+ST_CRC_SeuratObjects <- 
+  lapply(ST_CRC_SeuratObjects, function(x){
+    current_sample <- unique(x@meta.data$orig.ident)
+    
+    results_C2L_decon_currentSample <- results_C2L_decon %>% 
+      dplyr::filter(sample == current_sample)
+      
+    
+    x@meta.data <- x@meta.data %>% 
+      tibble::rownames_to_column("spot_id") %>%
+      dplyr::left_join(results_C2L_decon_currentSample, by = "spot_id") %>%
+      tibble::column_to_rownames("spot_id")
+    
+    
+    return(x)
+})
+```
+
+
+### Sample ST-colon1 (Untreated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-colon1"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon1_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon1_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon1_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_colon1_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon1_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon1_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+This sample present a CMS2 tumor with large islands separated by stromal 
+bundles. The abundance of CD8+ T cells is recuded and restricted to some of 
+those stomal regions. As in sample S2_Col_R_Rep1, the expression of NKD1 is 
+quite high in particular in the stromal and tumor regions. 
+LAMP5 and CXCL9 display scarce and sparse gene expression values.
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_colon1_CMS2
+
+ST_colon1_CMS2_histology <- 
+  Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0))  + theme(legend.text = element_blank(), legend.title = element_blank(), legend.key = element_rect(fill = "white"))
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon1_CD8 + ST_colon1_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon1_NKD1 + ST_colon1_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_colon1_CXCL9
+```
+
+
+### Sample ST-liver1 (Untreated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-liver1"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver1_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver1_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver1_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_liver1_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver1_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver1_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_liver1_CMS2
+
+ST_liver1_CMS2_histology <- 
+  Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0))  + theme(legend.text = element_blank(), legend.title = element_blank(), legend.key = element_rect(fill = "white"))
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver1_CD8 + ST_liver1_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver1_NKD1 + ST_liver1_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_liver1_CXCL9
+```
+
+
+### Sample ST-colon2 (Untreated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-colon2"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon2_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon2_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon2_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_colon2_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon2_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon2_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+
+This sample presents a reduced CMS2 tumor surrounded by some immune cell 
+infiltrates where we can see relative high abundance of CD8+ T cells.  
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_colon2_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon2_CD8 + ST_colon2_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon2_NKD1 + ST_colon2_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_colon2_CXCL9
+```
+
+
+### Sample ST-liver2 (Untreated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-liver2"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver2_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver2_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver2_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_liver2_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver2_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver2_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_liver2_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver2_CD8 + ST_liver2_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver2_NKD1 + ST_liver2_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_liver2_CXCL9
+```
+
+
+### Sample ST-colon3 (treated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-colon3"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon3_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon3_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon3_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_colon3_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon3_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon3_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+In this sample, the tumor content is very limited in both the primary CRC tumor
+and its corresponding liver metastasis. 
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_colon3_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon3_CD8 + ST_colon3_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon3_NKD1 + ST_colon3_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_colon3_CXCL9
+```
+
+
+### Sample ST-liver3 (treated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-liver3"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver3_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver3_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver3_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_liver3_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver3_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver3_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_liver3_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver3_CD8 + ST_liver3_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver3_NKD1 + ST_liver3_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_liver3_CXCL9
+```
+
+
+### Sample ST-colon4 (treated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-colon4"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon4_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon4_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_colon4_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_colon4_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon4_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_colon4_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+This sample contains in the primary and the metastic tumor similar spatial 
+patterns to the ones described for the S2_Col_R_Rep1 sample. 
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_colon4_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon4_CD8 + ST_colon4_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_colon4_NKD1 + ST_colon4_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_colon4_CXCL9
+```
+
+
+### Sample ST-liver4 (treated)
+
+```{r, warning=FALSE, message=FALSE}
+current_sample <- "ST-liver4"
+current_seurat_obj <- ST_CRC_SeuratObjects[[current_sample]]
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# Cell2Location plots: Estimated cell abundance by the deconvolution 
+current_cell_type <- c("CMS2")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver4_CMS2 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CMS2 Tumor cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("CD8+ T cells")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver4_CD8 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated CD8+ T cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+current_cell_type <- c("Myofibroblasts")
+breaks_vec <- round(seq(0, max(dplyr::pull(current_seurat_obj@meta.data,
+  current_cell_type)), length.out= 5),1)
+
+ST_liver4_Myofibroblasts <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = c(current_cell_type), alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("Estimated Myofibroblasts cells abundance") + 
+      scale_fill_gradient2(high = "#67000D", mid = "#FC9272", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) +
+        theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+
+## Gene Expression plots. 
+current_gene <- c("NKD1")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+
+ST_liver4_NKD1 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("NKD1 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("LAMP5")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver4_LAMP5 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("LAMP5 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+current_gene <- c("CXCL9")
+breaks_vec <- 
+    round(seq(min(GetAssayData(current_seurat_obj)[current_gene,]), 
+              max(GetAssayData(current_seurat_obj)[current_gene,]), length.out= 4),1)
+
+ST_liver4_CXCL9 <- 
+    Seurat::SpatialFeaturePlot(
+      object = current_seurat_obj,
+      features = current_gene, alpha = c(0,1), 
+      image.alpha = 0.6, pt.size.factor = 1.75, stroke = 1) + 
+      ggtitle("CXCL9 Expression") + 
+      scale_fill_gradient(high = "#67000D", low = "white", 
+                      breaks=breaks_vec,name=NULL ) + 
+      theme(legend.position="bottom", legend.key.height = unit(0.75, 'cm'),
+        legend.text = element_text(size=10, face="bold"),
+        legend.title = element_text(NULL),
+        title = element_text(face = "bold", size= 12), 
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+Seurat::SpatialPlot(current_seurat_obj, image.alpha = 1, alpha = c(0, 0)) +  
+  NoLegend() + ST_liver4_CMS2
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver4_CD8 + ST_liver4_Myofibroblasts
+```
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=8, fig.width=10}
+ST_liver4_NKD1 + ST_liver4_LAMP5
+```
+
+
+```{r, warning=FALSE, message=FALSE, dpi=80, fig.height=6, fig.width=6}
+ST_liver4_CXCL9
+```
+
+# Publication Plots
+
+```{r, warning=TRUE, message=FALSE, dpi=300, fig.width=10, fig.height=12}
+p_1_1 <- S2_Col_R_Rep1_CMS2_histology + ggtitle("H&E Image") + 
+  theme(legend.position = "left") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), 
+        legend.title = element_blank(), 
+        title = element_text(size= 10, face = "bold"), 
+        plot.title = element_text(hjust = 0.5)) + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+p_1_2 <- S2_Col_R_Rep1_CMS2  +  theme(legend.position = "right") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("# CMS2 Tumor cells") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+p_1_3 <- S2_Col_R_Rep1_NKD1 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("NKD1 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+p_1_4 <- S2_Col_R_Rep1_LAMP5 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("LAMP5 Expression") +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+p_2_1 <- S3_Col_R_Rep1_CMS1_histology + ggtitle("H&E Image") + 
+  theme(legend.position = "left") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'),   
+        title = element_text(size= 10, face = "bold"), 
+        plot.title = element_text(hjust = 0.5)) + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+  
+
+p_2_2 <- S3_Col_R_Rep1_CMS1  +  theme(legend.position = "right") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("# CMS1 Tumor cells")+ 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+p_2_3 <- S3_Col_R_Rep1_NKD1 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("NKD1 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+p_2_4 <- S3_Col_R_Rep1_LAMP5 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("LAMP5 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+p_3_1 <- ST_colon1_CMS2_histology + ggtitle("H&E Image") + 
+  theme(legend.position = "left") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'),   
+        title = element_text(size= 10, face = "bold"), 
+        plot.title = element_text(hjust = 0.5)) + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+  
+  
+p_3_2 <- ST_colon1_CMS2 +  theme(legend.position = "right") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("# CMS2 Tumor cells") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+  
+  
+p_3_3 <- ST_colon1_NKD1 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("NKD1 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  
+p_3_4 <- ST_colon1_LAMP5 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("LAMP5 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+p_4_1 <- ST_liver1_CMS2_histology + ggtitle("H&E Image") + 
+  theme(legend.position = "left") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'),   
+        title = element_text(size= 10, face = "bold"), 
+        plot.title = element_text(hjust = 0.5)) + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+p_4_2 <-     ST_liver1_CMS2 +  theme(legend.position = "right") + 
+  theme(# legend.key.size = unit(0.25, 'cm'), #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("# CMS2 Tumor cells") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+p_4_3 <- ST_liver1_NKD1 + theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("NKD1 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  
+p_4_4 <- ST_liver1_LAMP5 + 
+  theme(legend.position = "right", #change legend key size
+        legend.key.height = unit(0.75, 'cm'), #change legend key height
+        legend.key.width = unit(0.25, 'cm'), #change legend key width
+        legend.title = element_text(size=10), #change legend title font size
+        legend.text = element_text(size=10), 
+        title = element_text(size= 10), 
+        plot.title = element_text(hjust = 0.5)) + ggtitle("LAMP5 Expression") + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+plot_grid(p_1_1, p_1_2, p_1_3, p_1_4, 
+          p_2_1, p_2_2, p_2_3, p_2_4,
+          p_3_1, p_3_2, p_3_3, p_3_4,
+          p_4_1, p_4_2, p_4_3, p_4_4,
+          nrow = 4, ncol = 4)
+```
+
+
+
+
+# Conclusion
+
+# Session Info Details
+
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

@@ -1,0 +1,93 @@
+---
+title: "Run feature selection models"
+author: "Iakov Davydov"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_collection: "UUID"
+  output_collection: "UUID"
+  skip_export: FALSE
+  .arv_save:
+    value:
+      collection: "UUID"
+      filename: "{basename(html_filename)}"
+---
+
+```{r libs, message=FALSE, warning=FALSE}
+library(glmnet)
+library(tidyverse)
+library(mlr3verse)
+```
+
+```{r funcs}
+source("../src/eset_transformation.R")
+source("../src/mlr_helpers.R")
+```
+
+
+```{r "random seed"}
+# supposedly future should handle paralellization & random namber generation properly
+set.seed(42)
+```
+
+Load ExpressionSet object.
+```{r "load eset"}
+eset_train <- aws.s3::s3readRDS("eset_train.Rds", params$output_collection)
+eset_validation <- aws.s3::s3readRDS("eset_validation.Rds", params$output_collection)
+```
+
+Create tibbles for training.
+```{r "create training df"}
+all_rnaseq <- create_modeling_df(eset_train)
+```
+
+
+Tasks
+```{r tasks}
+task <- TaskClassif$new(id = "all_rnaseq", backend = all_rnaseq, target = "IHC_Status")
+task$set_col_roles("IHC_Status", roles = c("target", "stratum"))
+```
+
+Learner
+```{r learner}
+learner <- lrn(
+  "classif.cv_glmnet", alpha = 1, predict_type = "prob", keep = TRUE
+)
+```
+
+```{r cv}
+cv <- rsmp("repeated_cv", repeats = 100, folds = 10)
+```
+
+```{r "train model"}
+future::plan(future.batchtools::batchtools_lsf,
+  workers = 100,
+  resources = list(walltime = 4 * 60 * 60, memory = 16 * 1024)
+)
+res <- resample(task, learner, cv, store_models = TRUE)
+```
+
+```{r "save local copy"}
+saveRDS(res, here::here("data/feature_selection_res.Rds"))
+```
+
+```{r "extract results"}
+res_dt <- as.data.table(res) %>%
+  mutate(coef = map(res$learners, extr_glm_coef))
+
+# each glmnet model is ~3Mb; saving some space
+res_dt$learner <- NULL
+```
+
+
+```{r "save output", eval=!params$skip_export}
+aws.s3::s3saveRDS(
+  res_dt,
+  object = "model_selection_dt.Rds",
+  bucket = params$output_collection
+)
+```
