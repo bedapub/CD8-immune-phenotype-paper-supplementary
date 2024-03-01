@@ -1,6 +1,6 @@
-# Tumor-agnostic transcriptome-based classifier identifies spatial infiltration patterns of CD8+ T cells in the tumor microenvironment and predicts clinical # outcome in early- and late-phase clinical trials
+# Tumor-agnostic transcriptome-based classifier identifies spatial infiltration patterns of CD8+ T cells in the tumor microenvironment and predicts clinical outcome in early- and late-phase clinical trials
 
-This is a repository for accompanying analysis code.
+This is a repository for accompanying analysis code for the [manuscipt](https://www.biorxiv.org/content/10.1101/2023.10.02.560086v1.abstract).
 
 The trained model can predict CD8 immune phenotype from RNA-Seq counts data
 can be found [here](https://github.com/bedapub/cd8ippred).
